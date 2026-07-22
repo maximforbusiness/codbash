@@ -253,6 +253,45 @@ function readLines(filePath) {
 
 // Stream-based head reader: returns up to `maxLines` non-empty lines from the
 // beginning of `filePath`, without loading the whole file into memory. The
+// codex session files can be hundreds of MB — this is the fast path used by
+// parseCodexSessionFileFast / parsePiSessionFileFast for session listing.
+function readHeadLines(filePath, maxLines) {
+  return readLinesUntil(filePath, maxLines);
+}
+
+// Stream-based reader that stops once `maxLines` non-empty lines have been
+// collected. Returns null on read error and [] for empty/new files.
+function readLinesUntil(filePath, maxLines) {
+  const fd = fs.openSync(filePath, 'r');
+  try {
+    const buf = Buffer.alloc(64 * 1024);
+    let leftover = '';
+    const lines = [];
+    while (lines.length < maxLines) {
+      const n = fs.readSync(fd, buf, 0, buf.length, null);
+      if (n <= 0) break;
+      leftover += buf.toString('utf8', 0, n);
+      let idx;
+      while (lines.length < maxLines && (idx = leftover.indexOf('\n')) >= 0) {
+        const raw = leftover.slice(0, idx).replace(/\r$/, '');
+        if (raw.length) lines.push(raw);
+        leftover = leftover.slice(idx + 1);
+      }
+      if (leftover.length > 8 * 1024 * 1024) break;
+    }
+    if (lines.length < maxLines && leftover && leftover.replace(/\r$/, '').length) {
+      lines.push(leftover.replace(/\r$/, ''));
+    }
+    return lines;
+  } catch {
+    return null;
+  } finally {
+    try { fs.closeSync(fd); } catch {}
+  }
+}
+
+// Stream-based head reader: returns up to `maxLines` non-empty lines from the
+// beginning of `filePath`, without loading the whole file into memory. The
 // codex session files can be hundreds of MB — this is the fast path for
 // session listing.
 function readHeadLines(filePath, maxLines) {
@@ -4071,6 +4110,53 @@ function loadSessionDetail(sessionId, project) {
   }
 
   const messages = [];
+  // Fast path for large Codex session files (up to hundreds of MB).
+  // Stop after 200 real messages instead of reading the whole file first and
+  // truncating afterwards. For Claude files (small) the old path is preserved
+  // automatically by falling through.
+  if (found.format === 'codex') {
+    const detLines = readLinesUntil(found.file, 200 * 6);
+    for (const line of detLines) {
+      try {
+        const entry = JSON.parse(line);
+        if (entry.type !== 'response_item' || !entry.payload) continue;
+        const pType = entry.payload.type;
+        const role = entry.payload.role;
+        if (role === 'user' || role === 'assistant') {
+          const content = extractContent(entry.payload.content);
+          if (content && !isSystemMessage(content)) {
+            const msg = { role: role, content: content.slice(0, 2000), uuid: '' };
+            const structured = parseStructuredMessage('codex', role, content, entry);
+            if (structured) msg.structured = structured;
+            messages.push(msg);
+          }
+        }
+        if (pType === 'function_call') {
+          const name = entry.payload.name || '';
+          if (name.startsWith('mcp__')) {
+            const parts = name.split('__');
+            if (parts.length >= 3) {
+              const lastMsg = messages.length > 0 ? messages[messages.length - 1] : null;
+              if (lastMsg && lastMsg.role === 'assistant') {
+                if (!lastMsg.tools) lastMsg.tools = [];
+                if (!lastMsg._toolSeen) lastMsg._toolSeen = new Set();
+                const tool = parts.slice(2).join('__');
+                const key = 'mcp:' + parts[1] + ':' + tool;
+                if (!lastMsg._toolSeen.has(key)) {
+                  lastMsg._toolSeen.add(key);
+                  lastMsg.tools.push({ type: 'mcp', server: parts[1], tool: tool });
+                }
+              }
+            }
+          }
+        }
+        if (messages.length >= 200) break;
+      } catch {}
+    }
+    for (const m of messages) { if (m._toolSeen) delete m._toolSeen; }
+    return { messages };
+  }
+
   const lines = readLines(found.file);
 
   for (const line of lines) {
