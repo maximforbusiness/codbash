@@ -76,10 +76,14 @@ async function openDetail(s) {
   } else if (activeSessions[s.id]) {
     infoHtml += '<button class="launch-btn" style="background:var(--accent-green);color:#000" onclick="focusSession(\'' + jsId + '\')">Focus Terminal</button>';
   } else {
+    // Resume opens in the in-app Workspace terminal (new tab in the same window)
+    // instead of spawning a new external Terminal.app window every time.
+    infoHtml += '<button class="launch-btn" style="background:var(--accent-green);color:#000" onclick="openSessionInWorkspace(\'' + jsId + '\')" title="Open in the in-app terminal (new tab)">&#9654; Resume</button>';
+    // Optional: keep the external-terminal launcher available under a separate button
     if (s.tool === 'pi') {
-      infoHtml += '<button class="launch-btn" onclick="launchPiSession(\'' + jsId + '\',\'' + jsTool + '\',\'' + jsProject + '\')">Resume</button>';
+      infoHtml += '<button class="launch-btn btn-secondary" onclick="launchPiSession(\'' + jsId + '\',\'' + jsTool + '\',\'' + jsProject + '\')" title="Open in external native terminal">Open external</button>';
     } else {
-      infoHtml += '<button class="launch-btn" onclick="launchSession(\'' + jsId + '\',\'' + jsTool + '\',\'' + jsProject + '\')">Resume</button>';
+      infoHtml += '<button class="launch-btn btn-secondary" onclick="launchSession(\'' + jsId + '\',\'' + jsTool + '\',\'' + jsProject + '\')" title="Open in external native terminal">Open external</button>';
     }
     if (s.tool === 'claude') {
       infoHtml += '<button class="launch-btn" style="background:var(--accent-orange);color:#000" onclick="launchDangerous(\'' + jsId + '\',\'' + jsProject + '\')" title="--dangerously-skip-permissions">Resume (skip perms)</button>';
