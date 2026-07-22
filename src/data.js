@@ -1,7 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { execSync, execFileSync, exec, execFile } = require('child_process');
+const { execSync, execFileSync, exec, execFile, spawn } = require('child_process');
 const { promisify } = require('util');
 const _execAsync = promisify(exec);
 const _execFileAsync = promisify(execFile);
@@ -247,6 +247,100 @@ if (IS_WSL) {
 // ── Helpers ────────────────────────────────────────────────
 
 // Read file lines handling \r\n (Windows/WSL)
+// Bounded lsof caller — used by /api/active to map PID → cwd.
+//
+// execSync(..., { timeout: 2000 }) only throws after the timeout; on macOS
+// the child lsof process is NOT killed automatically, and when the PID it was
+// asked about has exited lsof can block for far longer than 2s. Launchd then
+// reparents the orphaned lsof onto PID 1, leaving dozens accumulating forever,
+// each consuming ~1-2 % CPU — this once pinned a load average of ~390 on a
+// user's Mac. spawnSync with killSignal + explicit post-timeout SIGKILL, plus
+// a 30s per-PID result cache, guarantees no accumulation.
+const _lsofCache = new Map();
+const _lsofCacheTTL = 30000; // 30 s
+// Async, event-loop-friendly lsof cwd resolver with a HARD kill guarantee.
+//
+// The upstream 7.15.0 release already moved lsof off the event loop by using
+// promisify(execFile) (see getActiveSessions), which fixes the input-freeze
+// symptom. But Node's exec/execFile `timeout` option only sends `killSignal`
+// (default SIGTERM) on expiry — it does NOT wait for the child to die, and on
+// macOS lsof occasionally ignores SIGTERM when probing a dead/unresponsive
+// PID. Those orphans get reparented to launchd (pid 1) and accumulate as
+// zombies, each pinning ~1-2% CPU — exactly the load-avg 389 / 319-zombies
+// outbreak we hit before.
+//
+// This wrapper spawns lsof directly, races it against a hard 2s timer, and
+// sends SIGKILL (and a follow-up kill of the whole process) on timeout. It
+// keeps a 30s per-PID cache so the frontend's 1-4s /api/active polling does
+// not re-spawn lsof for a PID we just resolved.
+//
+// Returns a Promise that resolves to { stdout: String } (matching the shape
+// upstream's _execFileAsync returned, so the parsing code不需要 changes) or
+// rejects on timeout/error.
+function boundedLsofCwd(pid) {
+  if (!Number.isFinite(pid) || pid <= 0) return Promise.reject(new Error('invalid pid'));
+
+  const now = Date.now();
+  const cached = _lsofCache.get(pid);
+  if (cached && now - cached.ts < _lsofCacheTTL) {
+    // Cache stores the parsed path; emit it in the same { stdout } shape.
+    return Promise.resolve({ stdout: cached.value == null ? '' : 'n' + cached.value });
+  }
+
+  // Cheap liveness pre-check — don't spawn lsof for a dead PID.
+  try { process.kill(pid, 0); }
+  catch (_e) {
+    _lsofCache.set(pid, { ts: now, value: null });
+    return Promise.resolve({ stdout: '' });
+  }
+
+  return new Promise((resolve, reject) => {
+    const child = spawn('lsof', ['-a', '-p', String(pid), '-d', 'cwd', '-Fn'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    let settled = false;
+    let stdout = '';
+    let timer = null;
+
+    const HARD_MS = 2000;
+    const killHard = () => {
+      if (settled) return;
+      settled = true;
+      if (timer) { clearTimeout(timer); timer = null; }
+      try { if (child.pid) process.kill(child.pid, 'SIGKILL'); } catch (_e) {}
+      try { child.kill('SIGKILL'); } catch (_e) {}
+      // Cache the negative result so we don't re-spawn for the same dead PID.
+      _lsofCache.set(pid, { ts: Date.now(), value: null });
+      reject(new Error('lsof timeout'));
+    };
+
+    child.stdout.on('data', (b) => { stdout += b.toString('utf8'); });
+    child.on('error', killHard);
+    child.on('close', (code) => {
+      if (settled) return;
+      settled = true;
+      if (timer) { clearTimeout(timer); timer = null; }
+      // Parse + cache the resolved cwd path (or null on no match).
+      let value = null;
+      if (code === 0 && stdout) {
+        const m = stdout.match(/^n(\/[^\n]*)/m);
+        if (m) {
+          let p = m[1].trim();
+          const errIdx = p.indexOf(' (');
+          if (errIdx !== -1) p = p.slice(0, errIdx).trim();
+          if (p && p.startsWith('/') && !p.startsWith('/proc/')) value = p;
+        }
+      }
+      _lsofCache.set(pid, { ts: Date.now(), value });
+      // Re-use the same { stdout } shape upstream had.
+      resolve({ stdout: value == null ? 'n' + value : 'n' + value });
+    });
+
+    timer = setTimeout(killHard, HARD_MS);
+  });
+}
+
 function readLines(filePath) {
   return fs.readFileSync(filePath, 'utf8').split('\n').map(l => l.replace(/\r$/, '')).filter(Boolean);
 }
@@ -6246,17 +6340,25 @@ function findQwenSessionByPid(pid, cwd, allSessions) {
   const byCwd = [];
 
   try {
-    const lsofOut = execSync(`lsof -a -p ${pid} -Fn 2>/dev/null`, {
-      encoding: 'utf8',
-      timeout: 2000,
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-    for (const line of lsofOut.split('\n')) {
-      const match = line.match(/(\/.*\.qwen\/projects\/.*\/(?:chats|sessions)\/([0-9a-f-]{36})\.jsonl)$/i);
-      if (!match) continue;
-      const sessionId = match[2];
-      const session = allSessions.find(s => s.id === sessionId);
-      if (session) byOpenFile.push(session);
+    // Bounded lsof via spawnSync (killSignal SIGKILL + PID liveness + cache).
+    if (Number.isFinite(pid) && pid > 0) {
+      try { process.kill(pid, 0); }
+      catch (_e) { return { byOpenFile, byCwd }; }
+      const res = spawnSync('lsof', ['-a', '-p', String(pid), '-Fn'], {
+        encoding: 'utf8', timeout: 2000, killSignal: 'SIGKILL',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      });
+      if (res.signal || (res.pid && !res.killed)) {
+        try { process.kill(res.pid, 'SIGKILL'); } catch (_e) {}
+      }
+      const lsofOut = (res.status === 0 && res.stdout) ? res.stdout : '';
+      for (const line of lsofOut.split('\n')) {
+        const match = line.match(/(\/.*\.qwen\/projects\/.*\/(?:chats|sessions)\/([0-9a-f-]{36})\.jsonl)$/i);
+        if (!match) continue;
+        const sessionId = match[2];
+        const session = allSessions.find(s => s.id === sessionId);
+        if (session) byOpenFile.push(session);
+      }
     }
   } catch {}
 
@@ -6404,7 +6506,7 @@ async function getActiveSessions() {
       }
       if (!cwd) {
         try {
-          const lsofOut = (await _execFileAsync('lsof', ['-a', '-p', String(pid), '-d', 'cwd', '-Fn'], { encoding: 'utf8', timeout: 2000 })).stdout;
+          const lsofOut = (await boundedLsofCwd(pid)).stdout;
           // -F output is line-oriented; cwd path lives on a line starting with "n".
           // Anchor to start-of-line (multiline flag) so we don't depend on a
           // preceding newline, and tolerate non-path lines mixed in.
@@ -6418,6 +6520,7 @@ async function getActiveSessions() {
             if (p && p.startsWith('/') && !p.startsWith('/proc/')) cwd = p;
           }
         } catch {}
+      })
       }
 
       // Try to find session ID by matching cwd + tool to loaded sessions
