@@ -203,8 +203,10 @@ function startServer(host, port, openBrowser = true) {
       // - frame-ancestors 'none' / X-Frame-Options DENY to block clickjacking
       // - X-Content-Type-Options nosniff so the browser won't sniff text/html
       //   when our endpoints return JSON.
+      const _html = getHTML();
       res.writeHead(200, {
         'Content-Type': 'text/html; charset=utf-8',
+        'Content-Length': Buffer.byteLength(_html),
         'Content-Security-Policy': [
           "default-src 'self'",
           "script-src 'self' 'unsafe-inline'",
@@ -224,8 +226,6 @@ function startServer(host, port, openBrowser = true) {
         'X-Frame-Options': 'DENY',
         'Referrer-Policy': 'no-referrer',
       });
-      const _html = getHTML();
-      res.setHeader('Content-Length', Buffer.byteLength(_html));
       res.end(_html);
     }
 
