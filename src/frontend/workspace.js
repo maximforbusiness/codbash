@@ -1564,31 +1564,45 @@ function openInWorkspace(spec) {
   if (typeof setView === 'function') setView('workspace');
 }
 
-// Best-effort per-agent resume command. Prefilled (not auto-run) so the user
-// can review/edit before pressing Enter — safe even where syntax varies.
-function _wsResumeCommand(tool, id) {
+// Best-effort per-agent resume command. Auto-run (trailing Enter) when opened
+// from a session card via openSessionInWorkspace(). We build the same command
+// text the native-terminal path would run so workspace resume matches external
+// resume behaviour.
+function _wsResumeCommand(tool, id, s) {
   switch (tool) {
     case 'claude':
     case 'claude-ext': return 'claude --resume ' + id;
     case 'codex': return 'codex resume ' + id;
+    case 'qwen': return 'qwen -r ' + id;
+    case 'kilo': return 'kilo resume ' + id;
     case 'opencode': return 'opencode';
     case 'kiro': return 'kiro-cli';
-    case 'qwen': return 'qwen';
     case 'gemini': return 'gemini';
-    case 'pi': return 'pi';
+    case 'pi': {
+      // pi resume target is the session file path (resume_target), not id,
+      // matching buildAgentCommand() in terminals.js. Fall back to id.
+      var target = (s && s.resume_target) ? s.resume_target : id;
+      // Decide pi vs omp based on agent_variant if present — give pi the
+      // --session form, omp the --resume form.
+      var variant = s && s.agent_variant;
+      if (variant === 'ohmypi') return 'omp --resume "' + String(target).replace(/"/g, '\\"') + '"';
+      return 'pi --session "' + String(target).replace(/"/g, '\\"') + '"';
+    }
     default: return '';
   }
 }
 
 // Card action: open a pane in the session's project folder with the agent's
-// resume command prefilled (awaiting Enter). Used by the session cards.
+// resume command AUTO-RUN (Enter sent). Mirrors the native-terminal resume
+// UX but inside the in-app Workspace terminal so the user gets a live agent
+// session in a tab, not just a printed command awaiting manual Enter.
 function openSessionInWorkspace(sessionId) {
   var list = (typeof allSessions !== 'undefined' && allSessions) ? allSessions : [];
   var s = list.find(function (x) { return x.id === sessionId; });
   if (!s) return;
   var cwd = s.git_root || s.project || null;
-  var resume = _wsResumeCommand(s.tool, s.id);
-  openInWorkspace({ name: _wsProjectBasename(cwd) || s.tool, cwd: cwd, prefill: resume || null });
+  var resume = _wsResumeCommand(s.tool, s.id, s);
+  openInWorkspace({ name: _wsProjectBasename(cwd) || s.tool, cwd: cwd, cmd: resume || null });
 }
 
 // Projects action: open up to `n` (1-4) panes all cd'd into a project folder.
