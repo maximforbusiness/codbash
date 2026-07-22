@@ -224,7 +224,9 @@ function startServer(host, port, openBrowser = true) {
         'X-Frame-Options': 'DENY',
         'Referrer-Policy': 'no-referrer',
       });
-      res.end(getHTML());
+      const _html = getHTML();
+      res.setHeader('Content-Length', Buffer.byteLength(_html));
+      res.end(_html);
     }
 
     // Favicon - inline SVG
@@ -1558,8 +1560,9 @@ async function handleCloudProxy(req, res, pathname) {
 
 // ── Helpers ─────────────────────────────────
 function json(res, data, status = 200) {
-  res.writeHead(status, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify(data));
+  const body = JSON.stringify(data);
+  res.writeHead(status, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) });
+  res.end(body);
 }
 
 // Cap request bodies at 2 MB. Without a limit a local process (or a page
