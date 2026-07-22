@@ -1151,12 +1151,26 @@ function startServer(host, port, openBrowser = true) {
     console.log('  \x1b[2mPress Ctrl+C to stop\x1b[0m');
     console.log('');
 
-    // Warm the optional native terminal module (@lydell/node-pty) in the
-    // background. The require() blocks the loop briefly (~1s) the first time, but
-    // running it here overlaps the Electron window/page-load dead time — before
-    // the frontend ever asks for /api/terminal/status — so the terminal-first
-    // landing opens its first pane instantly instead of paying the load then.
+    // Warm two expensive modules in parallel on startup, both deferred via
+    // setImmediate so the server can start accepting connections immediately
+    // while these run off the listen() callback path:
+    //   1) the optional native terminal module (@lydell/node-pty) — its first
+    //      require() blocks the loop briefly (~1s); warming it here overlaps
+    //      the Electron window/page-load dead time so the terminal-first
+    //      landing opens its first pane instantly.
+    //   2) the sessions cache — the first /api/sessions request would otherwise
+    //      block the event loop for ~4 seconds (serializing every other request
+    //      and freezing the desktop app).
     setImmediate(() => { try { terminal.isTerminalAvailable(); } catch (_e) {} });
+    setImmediate(() => {
+      try {
+        const t0 = Date.now();
+        const warmed = loadSessions();
+        log('DATA', `cache warmed: ${warmed.length} sessions in ${Date.now() - t0}ms`);
+      } catch (e) {
+        log('ERROR', 'cache warm failed: ' + (e && e.message));
+      }
+    });
 
     if (openBrowser) {
       if (process.platform === 'darwin') {
