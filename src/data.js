@@ -251,6 +251,42 @@ function readLines(filePath) {
   return fs.readFileSync(filePath, 'utf8').split('\n').map(l => l.replace(/\r$/, '')).filter(Boolean);
 }
 
+// Stream-based head reader: returns up to `maxLines` non-empty lines from the
+// beginning of `filePath`, without loading the whole file into memory. The
+// codex session files can be hundreds of MB — this is the fast path for
+// session listing.
+function readHeadLines(filePath, maxLines) {
+  const fd = fs.openSync(filePath, 'r');
+  try {
+    const buf = Buffer.alloc(64 * 1024);
+    let leftover = '';
+    const lines = [];
+    while (lines.length < maxLines) {
+      const n = fs.readSync(fd, buf, 0, buf.length, null);
+      if (n <= 0) break;
+      leftover += buf.toString('utf8', 0, n);
+      let idx;
+      while (lines.length < maxLines && (idx = leftover.indexOf('\n')) >= 0) {
+        const raw = leftover.slice(0, idx).replace(/\r$/, '');
+        if (raw.length) lines.push(raw);
+        leftover = leftover.slice(idx + 1);
+      }
+      // If the chunk had no newline yet, keep accumulating; for very long
+      // single-line files, cap to avoid OOM.
+      if (leftover.length > 8 * 1024 * 1024) break;
+    }
+    // last line without newline
+    if (lines.length < maxLines && leftover && leftover.replace(/\r$/, '').length) {
+      lines.push(leftover.replace(/\r$/, ''));
+    }
+    return lines;
+  } catch {
+    return null;
+  } finally {
+    try { fs.closeSync(fd); } catch {}
+  }
+}
+
 function parseTimestamp(value) {
   if (typeof value === 'number' && Number.isFinite(value)) return value;
   if (typeof value === 'string') {
@@ -744,6 +780,101 @@ function findPiSessionHeaderLine(lines) {
 }
 
 
+function parsePiSessionFileFast(sessionFile) {
+  if (!fs.existsSync(sessionFile)) return null;
+  let stat;
+  try { stat = fs.statSync(sessionFile); } catch { return null; }
+  // Только первые ~60 строк: session header всегда в первых 50, first message — рядом
+  const lines = readHeadLines(sessionFile, 60);
+  if (!lines || !lines.length) return null;
+
+  const foundHeader = findPiSessionHeaderLine(lines);
+  const header = foundHeader.header;
+  const headerLine = foundHeader.line;
+  if (!header) return null;
+
+  let sessionId = String(header.id);
+  if (!SAFE_PI_SESSION_ID.test(sessionId)) return null;
+  let projectPath = typeof header.cwd === 'string' ? header.cwd : '';
+  let title = typeof header.title === 'string' ? header.title.trim().slice(0, 200) : '';
+  if (!title) {
+    for (let i = 0; i < headerLine; i++) {
+      try {
+        const entry = JSON.parse(lines[i]);
+        if (entry && entry.type === 'title' && typeof entry.title === 'string' && entry.title.trim()) {
+          title = entry.title.trim().slice(0, 200);
+          break;
+        }
+      } catch {}
+    }
+  }
+  let msgCount = 0;
+  let userMsgCount = 0;
+  let firstMsg = '';
+  let firstTs = parseTimestamp(header.timestamp);
+  let lastTs = firstTs;
+  if (!Number.isFinite(firstTs)) firstTs = stat.mtimeMs;
+  if (!Number.isFinite(lastTs)) lastTs = stat.mtimeMs;
+  let model = '';
+  let hasUsage = false;
+  let explicitCost = false;
+
+  for (let i = headerLine + 1; i < lines.length; i++) {
+    try {
+      const entry = JSON.parse(lines[i]);
+      const ts = parseTimestamp(entry.timestamp || entry.ts);
+      if (Number.isFinite(ts)) {
+        if (ts < firstTs) firstTs = ts;
+        if (ts > lastTs) lastTs = ts;
+      }
+
+      if (!projectPath && typeof entry.cwd === 'string') projectPath = entry.cwd;
+      const msg = entry.message || {};
+      if (!model && typeof entry.model === 'string') model = entry.model;
+      if (!model && typeof msg.model === 'string') model = msg.model;
+
+      if (entry.type !== 'message') continue;
+      const role = msg.role || entry.role;
+      if (role !== 'user' && role !== 'assistant') continue;
+      const text = extractPiText(msg.content !== undefined ? msg.content : entry.content);
+      if (!text || isSystemMessage(text)) continue;
+
+      msgCount++;
+      if (role === 'user') userMsgCount++;
+      if (!firstMsg && role === 'user') firstMsg = text.slice(0, 200);
+
+      const usage = normalizePiUsage(msg.usage || entry.usage);
+      if (usage) {
+        hasUsage = true;
+        if (usage.cost !== null) explicitCost = true;
+      }
+    } catch {}
+  }
+
+  // Для маленьких файлов (где мы прочитали всё) msgCount точный;
+  // для больших оцениваем по размеру файла. lastTs дополним stat.mtimeMs.
+  if (lines.length >= 60) {
+    // дочитанный «хвост» не виделся — оцениваем кол-во сообщений
+    msgCount = Math.max(msgCount, Math.max(1, Math.floor(stat.size / 2048)));
+    if (Number.isFinite(stat.mtimeMs) && stat.mtimeMs > lastTs) lastTs = stat.mtimeMs;
+  }
+
+  return {
+    sessionId,
+    projectPath,
+    title,
+    msgCount,
+    userMsgCount,
+    firstMsg,
+    firstTs,
+    lastTs,
+    fileSize: stat.size,
+    model,
+    hasUsage,
+    explicitCost,
+  };
+}
+
 function parsePiSessionFile(sessionFile) {
   if (!fs.existsSync(sessionFile)) return null;
 
@@ -883,7 +1014,7 @@ function scanPiSessions(agentDir, variant) {
   const files = listPiSessionFiles(agentDir);
 
   for (const filePath of files) {
-    const summary = parsePiSessionFile(filePath);
+    const summary = FAST_SCAN_ENABLED ? parsePiSessionFileFast(filePath) : parsePiSessionFile(filePath);
     if (!summary || !summary.sessionId) continue;
 
     const projectPath = summary.projectPath || '';
@@ -2658,6 +2789,93 @@ function loadCursorVscdbDetail(sessionId) {
   return { messages: messages.slice(0, 200) };
 }
 
+// Lightweight MetadataScanner for codex session files.
+// The full parser (parseCodexSessionFile) reads the entire JSONL (often 2+ GB total)
+// and runs JSON.parse on every line, which takes ~30s across 600 files. For the
+// sessions LIST we only need project path, first message, timestamps and a
+// message count. The session_meta is in the first line, first user message is
+// within the first few lines, and timestamps are monotonic — so we only need
+// the head of the file plus stat() for last_ts/fileSize/msgCount estimate.
+//
+// Enabled by default; set CODEDASH_FAST_SCAN=0 to fall back to the full parser.
+const FAST_SCAN_ENABLED = process.env.CODBASH_FAST_SCAN === '0' ? false : true;
+const FAST_SCAN_HEAD_LINES = 60; // session_meta + first message always land in first few lines
+
+function parseCodexSessionFileFast(sessionFile) {
+  let stat;
+  try { stat = fs.statSync(sessionFile); } catch { return null; }
+
+  const lines = readHeadLines(sessionFile, FAST_SCAN_HEAD_LINES);
+  if (!lines || !lines.length) return null;
+
+  let projectPath = '';
+  let msgCount = 0;
+  let userMsgCount = 0;
+  let firstMsg = '';
+  let firstTs = Infinity;
+  let lastTs = -Infinity;
+  const mcpSet = new Set();
+
+  for (const line of lines) {
+    try {
+      const entry = JSON.parse(line);
+      const ts = parseEntryTimestampMs(entry);
+      if (Number.isFinite(ts) && ts > 0) {
+        if (ts < firstTs) firstTs = ts;
+        if (ts > lastTs) lastTs = ts;
+      }
+
+      if (entry.type === 'session_meta' && entry.payload && entry.payload.cwd && !projectPath) {
+        projectPath = entry.payload.cwd;
+        continue;
+      }
+
+      if (entry.type !== 'response_item' || !entry.payload) continue;
+
+      if (entry.payload.type === 'function_call') {
+        const name = entry.payload.name || '';
+        if (name.startsWith('mcp__')) {
+          const parts = name.split('__');
+          if (parts.length >= 3) mcpSet.add(parts[1]);
+        }
+        continue;
+      }
+
+      const role = entry.payload.role;
+      if (role !== 'user' && role !== 'assistant') continue;
+
+      const content = extractContent(entry.payload.content);
+      if (!content || isSystemMessage(content)) continue;
+
+      msgCount++;
+      if (role === 'user') userMsgCount++;
+      if (!firstMsg) firstMsg = content.slice(0, 200);
+    } catch {}
+  }
+
+  // We only saw the head; supplement the tail's timestamp and a size-based
+  // message count estimate. For small files where we parsed everything, the
+  // parsed counts are authoritative; for large files we fall back to stat.
+  const estimatedMessages = msgCount > 0 && lines.length < FAST_SCAN_HEAD_LINES
+    ? msgCount
+    : Math.max(msgCount, Math.max(1, Math.floor(stat.size / 1024)));
+
+  const fallbackTs = Number.isFinite(stat.mtimeMs) ? stat.mtimeMs : Date.now();
+  if (!Number.isFinite(firstTs)) firstTs = fallbackTs;
+  if (!Number.isFinite(lastTs) || lastTs < firstTs) lastTs = fallbackTs;
+
+  return {
+    projectPath,
+    msgCount: estimatedMessages,
+    userMsgCount,
+    firstMsg,
+    firstTs,
+    lastTs,
+    fileSize: stat.size,
+    mcpServers: Array.from(mcpSet),
+  };
+}
+
 function parseCodexSessionFile(sessionFile) {
   if (!fs.existsSync(sessionFile)) return null;
 
@@ -2790,7 +3008,7 @@ function scanCodexSessions() {
         if (!uuidMatch) continue;
         const sid = uuidMatch[1];
         if (importedFromClaude.has(sid)) continue; // skip — original Claude file loaded separately
-        const summary = parseCodexSessionFile(f);
+        const summary = FAST_SCAN_ENABLED ? parseCodexSessionFileFast(f) : parseCodexSessionFile(f);
         if (!summary) continue;
 
         const existing = sessions.find(s => s.id === sid);
@@ -3507,8 +3725,7 @@ function loadSessions() {
   // Load Codex sessions
   if (fs.existsSync(CODEX_DIR)) {
     try {
-      const codexSessions = scanCodexSessions();
-      for (const cs of codexSessions) {
+    const codexSessions = scanCodexSessions();      for (const cs of codexSessions) {
         sessions[cs.id] = cs;
       }
     } catch {}
@@ -3517,8 +3734,7 @@ function loadSessions() {
   // Load Qwen Code sessions
   if (fs.existsSync(QWEN_DIR)) {
     try {
-      const qwenSessions = scanQwenSessions(QWEN_DIR);
-      for (const qs of qwenSessions) {
+      const qwenSessions = scanQwenSessions(QWEN_DIR);      for (const qs of qwenSessions) {
         sessions[qs.id] = qs;
       }
     } catch {}
@@ -3527,8 +3743,7 @@ function loadSessions() {
   // Load Pi sessions
   if (fs.existsSync(PI_SESSIONS_DIR)) {
     try {
-      const piSessions = scanPiSessions(PI_AGENT_DIR, 'pi');
-      for (const ps of piSessions) {
+      const piSessions = scanPiSessions(PI_AGENT_DIR, 'pi');      for (const ps of piSessions) {
         sessions[ps.id] = ps;
       }
     } catch {}
@@ -3537,8 +3752,7 @@ function loadSessions() {
   // Load OhMyPi sessions
   if (fs.existsSync(OMP_SESSIONS_DIR)) {
     try {
-      const ompSessions = scanPiSessions(OMP_AGENT_DIR, 'ohmypi');
-      for (const ps of ompSessions) {
+      const ompSessions = scanPiSessions(OMP_AGENT_DIR, 'ohmypi');      for (const ps of ompSessions) {
         sessions[ps.id] = ps;
       }
     } catch {}
@@ -3546,24 +3760,21 @@ function loadSessions() {
 
   // Load OpenCode sessions
   try {
-    const opencodeSessions = scanOpenCodeSessions();
-    for (const ocs of opencodeSessions) {
+    const opencodeSessions = scanOpenCodeSessions();    for (const ocs of opencodeSessions) {
       sessions[ocs.id] = ocs;
     }
   } catch {}
 
   // Load Cursor sessions
   try {
-    const cursorSessions = scanCursorSessions();
-    for (const cs of cursorSessions) {
+    const cursorSessions = scanCursorSessions();    for (const cs of cursorSessions) {
       sessions[cs.id] = cs;
     }
   } catch {}
 
   // Load Kiro sessions
   try {
-    const kiroSessions = scanKiroSessions();
-    for (const ks of kiroSessions) {
+    const kiroSessions = scanKiroSessions();    for (const ks of kiroSessions) {
       sessions[ks.id] = ks;
     }
 } catch {}
@@ -3578,22 +3789,19 @@ function loadSessions() {
 
 // Load Copilot CLI sessions
   try {
-    const copilotSessions = scanCopilotCliSessions();
-    for (const cs of copilotSessions) sessions[cs.id] = cs;
+    const copilotSessions = scanCopilotCliSessions();    for (const cs of copilotSessions) sessions[cs.id] = cs;
   } catch {}
 
 // Load Kilo CLI sessions
   try {
-    const kiloSessions = scanKiloCliSessions();
-    for (const ks of kiloSessions) {
+    const kiloSessions = scanKiloCliSessions();    for (const ks of kiloSessions) {
       sessions[ks.id] = ks;
     }
   } catch {}
 
 // Load Copilot Chat sessions
   try {
-    const copilotSessions = scanCopilotSessions();
-    for (const cs of copilotSessions) {
+    const copilotSessions = scanCopilotSessions();    for (const cs of copilotSessions) {
       sessions[cs.id] = cs;
     }
   } catch {}
@@ -3810,9 +4018,7 @@ function loadSessions() {
   // Flush disk caches
   _saveParsedDiskCache();
   _saveGitRootDiskCache();
-  _updateScanMarkers();
-
-  _sessionsCache = result;
+  _updateScanMarkers();  _sessionsCache = result;
   _sessionsCacheTs = Date.now();
   return result;
 }
