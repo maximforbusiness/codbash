@@ -273,10 +273,25 @@ function openInTerminal(sessionId, tool, flags, projectDir, terminalId, mode, co
   if (platform === 'darwin') {
     switch (terminalId) {
       case 'terminal':
-        execSync(`osascript -e 'tell application "Terminal"
-          activate
-          do script "${escapedCmd}"
-        end tell'`);
+        // Open as a new TAB in the current window if possible, otherwise a new window.
+        // 'do script' without a target defaults to the frontmost window's tab;
+        // we tell it explicitly so osascript doesn't pick a background one.
+        try {
+          execSync(`osascript -e 'tell application "Terminal"
+            activate
+            if (count of windows) > 0 then
+              tell front window to do script "${escapedCmd}"
+            else
+              do script "${escapedCmd}"
+            end if
+          end tell'`);
+        } catch {
+          // Fallback: plain new window.
+          execSync(`osascript -e 'tell application "Terminal"
+            activate
+            do script "${escapedCmd}"
+          end tell'`);
+        }
         break;
       case 'warp': {
         // Warp Launch Configurations API — write temp YAML, open via URI scheme
@@ -328,20 +343,42 @@ function openInTerminal(sessionId, tool, flags, projectDir, terminalId, mode, co
       }
       case 'iterm2':
       default: {
+        // Prefer a new TAB in the current window; only fall back to a new
+        // window when there is no existing iTerm window.
         const script = `
           tell application "iTerm"
             activate
-            set newWindow to (create window with default profile)
-            tell current session of newWindow
-              write text "${escapedCmd}"
-            end tell
+            if (count of windows) > 0 then
+              tell current window
+                set newTab to (create tab with default profile)
+                tell newTab
+                  write text "${escapedCmd}"
+                end tell
+              end tell
+            else
+              set newWindow to (create window with default profile)
+              tell current session of newWindow
+                write text "${escapedCmd}"
+              end tell
+            end if
           end tell
         `;
         try {
           execSync(`osascript -e '${script.replace(/'/g, "'\\''")}'`, { stdio: 'pipe' });
         } catch {
-          // Fallback to Terminal.app
-          execSync(`osascript -e 'tell application "Terminal" to do script "${escapedCmd}"'`);
+          // Fallback to Terminal.app — prefer a tab in the front window.
+          try {
+            execSync(`osascript -e 'tell application "Terminal"
+              activate
+              if (count of windows) > 0 then
+                tell front window to do script "${escapedCmd}"
+              else
+                do script "${escapedCmd}"
+              end if
+            end tell'`);
+          } catch (_e) {
+            execSync(`osascript -e 'tell application "Terminal" to do script "${escapedCmd}"'`);
+          }
         }
         break;
       }

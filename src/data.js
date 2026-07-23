@@ -6520,7 +6520,6 @@ async function getActiveSessions() {
             if (p && p.startsWith('/') && !p.startsWith('/proc/')) cwd = p;
           }
         } catch {}
-      })
       }
 
       // Try to find session ID by matching cwd + tool to loaded sessions
