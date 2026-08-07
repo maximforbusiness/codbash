@@ -234,6 +234,38 @@ function buildPosixShellCommand(cmd, projectDir) {
   return cdPart + cmd;
 }
 
+// Wrap a POSIX shell command in a process-group-aware reaper so that when
+// the hosting terminal (Terminal.app / iTerm2) closes the tab and sends SIGHUP
+// to its shell, every child the agent spawned (MCP servers, IPC workers, etc.)
+// is reaped rather than orphaned onto PID 1 where it lives forever — the
+// root cause of the "zombie pi processes accumulating" bug.
+//
+// The wrapper does three things (POSIX, no macOS-missing `setsid`):
+//   1. `trap` on SIGHUP/SIGTERM installs a cleanup that SIGTERMs the whole
+//      process group (kill -TERM 0), waits 2s for graceful shutdown, then
+//      SIGKILLs the group.
+//   2. The agent runs as a CHILD of the wrapper (NOT via `exec` — exec would
+//      replace the wrapper and its trap, leaving nothing to catch SIGHUP).
+//      Because the agent is a child, the wrapper `wait`s for it so the tab
+//      doesn't snap closed until the agent exits naturally.
+//   3. `kill 0` in POSIX means "every process in this process group". The agent
+//      and its forked workers all share this pgid (they don't `setsid`), so a
+//      single `kill 0` reaps the whole tree.
+//
+// Safety: original `cmd` is single-quoted with `\'` escaping so shell
+// metacharacters in cmd (flags, session IDs) are inert — it's run verbatim.
+// If the command isn't an agent we recognise, we leave it untouched.
+function reapWrapPosix(fullCmd) {
+  if (!/\b(pi|omp|claude|codex|qwen|kilo|kiro-cli|opencode|cursor-agent|gh copilot)\b/.test(fullCmd)) {
+    return fullCmd;
+  }
+  const sq = "'" + String(fullCmd).replace(/'/g, "'\\''") + "'";
+  // Reaper: SIGHUP/SIGTERM → SIGTERM the whole group + 2s grace + SIGKILL.
+  // Critically, the agent is run as a child (sh -c ${sq}) and the wrapper `wait`s
+  // — so trap stays armed and can catch the terminal's SIGHUP on close.
+  return `sh -c 'trap '"'"'kill -TERM 0; sleep 2; kill -KILL 0; exit 127'"'"' HUP TERM; sh -c ${sq}; wait'`;
+}
+
 function quotePowerShellSingle(value) {
   return "'" + String(value).replace(/'/g, "''") + "'";
 }
@@ -265,8 +297,14 @@ function buildWindowsTerminalArgs(cmd, projectDir) {
 function openInTerminal(sessionId, tool, flags, projectDir, terminalId, mode, commandOverride, resumeTarget) {
   const cmd = buildAgentCommand(sessionId, tool, flags, mode, commandOverride, resumeTarget);
   const fullCmd = buildPosixShellCommand(cmd, projectDir);
-  const escapedCmd = fullCmd.replace(/"/g, '\\"');
-  termLog('TERM', `openInTerminal: terminal=${terminalId || 'default'} tool=${tool} cmd="${fullCmd}"`);
+  // On macOS, launch the agent inside a process-group-aware reaper wrapper so
+  // closing the terminal tab kills the agent and all its worker children
+  // instead of orphaning them onto PID 1 (the "zombie pi processes" bug).
+  // Windows/WSL launch paths don't use this — they have their own process-tree
+  // management via Start-Process / wt.exe.
+  const wrappedFull = process.platform === 'darwin' ? reapWrapPosix(fullCmd) : fullCmd;
+  const escapedCmd = wrappedFull.replace(/"/g, '\\"');
+  termLog('TERM', `openInTerminal: terminal=${terminalId || 'default'} tool=${tool} cmd="${fullCmd}"${wrappedFull !== fullCmd ? ' [reap-wrapped]' : ''}`);
 
   const platform = process.platform;
 
@@ -320,6 +358,10 @@ function openInTerminal(sessionId, tool, flags, projectDir, terminalId, mode, co
         break;
       }
       case 'kitty':
+        // kitty (like alacritty) is a real terminal emulator that owns the
+        // process group of its shell — when the user closes the window, kitty
+        // SIGHUPs the whole group and reaps children correctly. No reaper
+        // wrapper needed; the un-wrapped fullCmd goes straight through.
         exec(`kitty --single-instance bash -c '${fullCmd}; exec bash'`);
         break;
       case 'alacritty':
