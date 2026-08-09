@@ -324,9 +324,35 @@ function handleUpgrade(req, socket, head, opts) {
   });
 
   let closed = false;
+  // ── Server-side heartbeat ──────────────────────────────────────────────────
+  // Codbash frontend keeps a WebSocket per pane, and `socket.on('close', cleanup)`
+  // reaps the pty when the UI closes the tab. BUT after a macOS sleep/wake the
+  // socket is soft-broken: the browser thinks it's gone, opens a NEW socket for
+  // a fresh pane, and never sends a close frame on the old one — while the TCP
+  // stack only notices via keepalive (often >1h on macOS). Meanwhile the old
+  // zsh + agent + worker tree keeps running on the stale /dev/ttysXYZ, never
+  // reaped — the root cause of accumulating "zombie pi" processes.
+  //
+  // Fix: the server pings the client every 30s (opcode 0x9, which xterm.js /
+  // the browser answer with 0xA). If we don't see a pong within 60s, the client
+  // is gone — destroy the socket and run cleanup() to kill the pty.
+  let lastPongTs = Date.now();
+  const heartbeatInterval = setInterval(() => {
+    if (closed) return;
+    // Send a ping. Browsers auto-reply with a pong — no app-level handling
+    // needed on the client. Payload is a tiny timestamp so each ping is unique.
+    try { socket.write(encodeFrame(Buffer.from(String(Date.now()), 'utf8'), 0x9)); } catch (_e) {}
+    if (Date.now() - lastPongTs > 60000) {
+      log('TERM', 'pty heartbeat timeout pid=' + term.pid + ' (no pong for 60s) — closing');
+      try { socket.destroy(); } catch (_e) {}
+      cleanup();
+    }
+  }, 30000);
+
   function cleanup() {
     if (closed) return;
     closed = true;
+    try { clearInterval(heartbeatInterval); } catch (_e) {}
     ptyRegistry.remove(term.pid);
     try { onData.dispose(); } catch (_e) {}
     try { onExit.dispose(); } catch (_e) {}
@@ -341,8 +367,12 @@ function handleUpgrade(req, socket, head, opts) {
       try { socket.end(); } catch (_e) {}
       return;
     }
-    if (opcode === 0x9) { // ping -> pong
+    if (opcode === 0x9) { // ping -> pong (client-initiated, rare)
       try { socket.write(encodeFrame(payload, 0xA)); } catch (_e) {}
+      return;
+    }
+    if (opcode === 0xA) { // pong — client is alive, reset heartbeat deadline
+      lastPongTs = Date.now();
       return;
     }
     if (opcode === 0x2) { // binary: raw stdin
