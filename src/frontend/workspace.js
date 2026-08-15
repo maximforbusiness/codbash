@@ -1595,10 +1595,34 @@ function _wsAttachDropTarget(host, term, pane) {
       // `.name` is a weaker but still-often-usable fallback.
       var files = dt.files;
       if (files && files.length) {
+        // In Electron 33 the renderer-side File object no longer exposes its
+        // filesystem path on the deprecated `.path` property (it's `undefined`
+        // when contextIsolation:true + nodeIntegration:false, which is our
+        // desktop/main.js config). `webUtils.getPathForFile(file)` IS the
+        // officially-blessed resolver for this — but it lives in the Electron
+        // main/preload world, so we reach it via the contextBridge the
+        // preload exposes on `window.codbashDesktop.getPathForFile`. The
+        // bridge passes the live File by reference (contextBridge doesn't
+        // serialize function arguments), so identity is preserved.
+        var _resolver = (window.codbashDesktop && typeof window.codbashDesktop.getPathForFile === 'function')
+          ? window.codbashDesktop.getPathForFile
+          : null;
         for (var i = 0; i < files.length; i++) {
           var f = files[i];
-          var p = (f && typeof f.path === 'string') ? f.path
-                : (f && f.name ? f.name : null);
+          var p = null;
+          // 1) The Electron desktop app exposes a preload bridge that can turn
+          //    the dropped File into an absolute path even in a sandboxed /
+          //    contextIsolated renderer. This is the only path that works in
+          //    Electron 33 for drag&drop from Finder.
+          if (_resolver && f) {
+            try { p = window.codbashDesktop.getPathForFile(f) || null; }
+            catch (_e) { p = null; }
+          }
+          // 2) Legacy `.path` — still set on very old Electron builds.
+          if (!p && f && typeof f.path === 'string' && f.path) p = f.path;
+          // 3) Last resort: bare filename. Not enough for the agent to locate
+          //    the file (no directory), but better than nothing.
+          if (!p && f && f.name) p = f.name;
           if (p) parts.push(_wsShellQuote(p));
         }
       }
