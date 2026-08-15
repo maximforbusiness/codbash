@@ -709,16 +709,15 @@ function _wsConnectPane(pane) {
     // Without this the renderer keyboard handler would just write Finder's
     // lossy `public.utf8-plain-text` representation (usually a bare filename,
     // which the running agent can't locate). contextBridge exposes
-    // window.codbashDesktop.readClipboardFilePaths() — see desktop/preload.js
-    // for the clipboard.readBuffer('public/file-url') plumbing.
+    // window.codbashDesktop.readClipboardFilePathsSync() — see desktop/preload.js
+    // for the ipcRenderer.sendSync('codbash:read-clipboard-files-sync') plumbing
+    // (sync IPC is required because xterm's custom key handler must return a
+    // boolean synchronously).
     if (e.type === 'keydown' && (e.key === 'v' || e.key === 'V') && !e.altKey) {
-      var modV = e.metaKey || (e.ctrlKey && e.shiftKey) || (e.metaKey === false && e.ctrlKey && e.shiftKey);
-      // Normalize: ⌘+V on macOS, Ctrl+Shift+V on Linux (xterm default for
-      // paste), and accept either with or without Shift.
       var isPaste = (e.metaKey && !e.altKey) || (e.ctrlKey && e.shiftKey);
-      if (isPaste && window.codbashDesktop && typeof window.codbashDesktop.readClipboardFilePaths === 'function') {
+      if (isPaste && window.codbashDesktop && typeof window.codbashDesktop.readClipboardFilePathsSync === 'function') {
         try {
-          var paths = window.codbashDesktop.readClipboardFilePaths();
+          var paths = window.codbashDesktop.readClipboardFilePathsSync();
           if (paths && paths.length) {
             var quoted = [];
             for (var pi = 0; pi < paths.length; pi++) {

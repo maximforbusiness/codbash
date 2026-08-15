@@ -17,72 +17,26 @@ function _getPathForFile(file) {
   try { return webUtils.getPathForFile(file) || ''; } catch (_e) { return ''; }
 }
 
-// Read absolute filesystem paths from the system clipboard when Finder,
-// Finder copies a file (⌘C). Finder writes several representations on macOS:
-//   • `public.file-url`       — one file:// URL per copied file
-//   • `public.file-url` UTI corresponds to NSFilenamesPboardType for legacy
-//     code, but the modern slot is the former.
-//   • `public.utf8-plain-text` — just the bare filename(s), lossy
-// We prefer the file-url wrapper and decode to a POSIX path; if the clipboard
-// only has plain text we return [] so the caller falls back to a normal
-// text paste. This is what powers the in-app terminal's ⌘V → path behaviour:
-// the user copies a file in Finder, focuses the pane, presses ⌘V and the
-// terminal types the quoted absolute path instead of doing nothing.
-function _fileUrlToPosix(url) {
-  // File URLs produced by NSPasteboard look like `file:///Users/me/x.txt`.
-  try { return decodeURIComponent(new URL(url).pathname); }
-  catch (_e) {
-    // Fall back to a manual strip of the `file://` prefix (handles cases where
-    // URL() might reject relative-looking file URLs).
-    if (typeof url === 'string' && url.indexOf('file://') === 0) return url.slice(7);
-    return '';
-  }
+// Read the absolute filesystem path(s) of file(s) currently in the system
+// clipboard — Finder's ⌘C writes a `public.file-url` (UTI 'furl') slot, plus a
+// lossy filename string. The renderer can't see this from a sandboxed /
+// contextIsolated renderer (browser Clipboard API strips the file:// URL); the
+// clipboard module is fully available in the MAIN process, so we IPC there and
+// return the resolved POSIX paths. Powers the in-app terminal's ⌘V → path
+// behaviour: user copies a file in Finder, focuses the pane, presses ⌘V and
+// the terminal types the quoted absolute path instead of the bare filename.
+// Returns [] for plain-text clipboards so the caller falls back to text paste.
+function _readClipboardFilePathsSync() {
+  // Synchronous wrapper for ⌘V interception — ipcRenderer.sendSync keeps the
+  // keyboard handler synchronous, which xterm requires (see attachCustomKey-
+  // EventHandler contract: an async return false would not block the paste).
+  try { return ipcRenderer.sendSync('codbash:read-clipboard-files-sync') || []; }
+  catch (_e) { return []; }
 }
 
+// Async variant for the Resolve button / non-key paths.
 function _readClipboardFilePaths() {
-  var out = [];
-  try {
-    if (!clipboard) return out;
-    // Multi-selection: Finder writes one `public.file-url` item per file.
-    // Electron's clipboard.readBuffer(format) only returns the first item,
-    // but for the common single-file copy we need that one path — good enough
-    // for now. (A truly multi-file path would iterate NSPasteboard items, but
-    // Electron's clipboard module exposes only 'the' contents.)
-    // Try the macOS UTI formats in two separators Electron accepts.
-    var formats = ['public/file-url', 'public.file-url', 'NSFilenamesPboardType'];
-    var urlBuf = null, usedFormat = null;
-    for (var i = 0; i < formats.length; i++) {
-      try {
-        if (clipboard.has(formats[i])) { urlBuf = clipboard.readBuffer(formats[i]); usedFormat = formats[i]; break; }
-      } catch (_e) {}
-    }
-    if (urlBuf && urlBuf.length > 0) {
-      var raw = urlBuf.toString('utf8');
-      if (usedFormat === 'NSFilenamesPboardType') {
-        // NeXT-style NSArray of NSString paths encoded as UTF-8:
-        // `<array><string>/path1</string>…</array>` — parse coarsely.
-        var pathMatches = raw.match(/<string>([^<]+)<\/string>/g) || [];
-        for (var j = 0; j < pathMatches.length; j++) {
-          var m = pathMatches[j].match(/^<string>([^<]+)<\/string>$/);
-          if (m) out.push(m[1]);
-        }
-        if (out.length === 0 && raw.trim()) {
-          // Single-string fallback.
-          out.push(raw.trim());
-        }
-      } else {
-        // file:// URL — can be either one, or several separated by newlines.
-        var lines = raw.split(/[\r\n]+/);
-        for (var k = 0; k < lines.length; k++) {
-          var line = lines[k].trim();
-          if (!line) continue;
-          var p = _fileUrlToPosix(line);
-          if (p) out.push(p);
-        }
-      }
-    }
-  } catch (_e) { out = []; }
-  return out;
+  return ipcRenderer.invoke('codbash:read-clipboard-files');
 }
 
 contextBridge.exposeInMainWorld('codbashDesktop', {
@@ -90,8 +44,9 @@ contextBridge.exposeInMainWorld('codbashDesktop', {
   // Resolve absolute filesystem path for a File obtained from a drop event —
   // returns '' if unavailable (e.g. running outside Electron).
   getPathForFile: _getPathForFile,
-  // Resolve filesystem paths from the system clipboard (macOS: Finder ⌘C → file(s)).
-  // Returns [] for text/image-only clipboards so callers fall back to plain text.
+  // Synchronous resolver — for xterm's attachCustomKeyEventHandler (⌘V).
+  readClipboardFilePathsSync: _readClipboardFilePathsSync,
+  // Async resolver — for non-key-press use cases.
   readClipboardFilePaths: _readClipboardFilePaths,
   // Resolves to the chosen absolute folder path, or null if the user cancels.
   pickFolder: () => ipcRenderer.invoke('codbash:pick-folder'),

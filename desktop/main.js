@@ -7,7 +7,7 @@
 // answers, then points a BrowserWindow at it.
 'use strict';
 
-const { app, BrowserWindow, shell, dialog, Menu, ipcMain } = require('electron');
+const { app, BrowserWindow, shell, dialog, Menu, ipcMain, clipboard } = require('electron');
 const { spawn } = require('child_process');
 const http = require('http');
 const net = require('net');
@@ -15,6 +15,107 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const { execFileSync } = require('child_process');
+
+// Read absolute POSIX paths of any file(s) currently in the system clipboard.
+// Powers the in-app terminal's ⌘V → path behaviour: copy a file in Finder,
+// focus the workspace pane, ⌘V, and the terminal inserts the quoted absolute
+// path instead of Finder's lossy filename string. Returns [] when the
+// clipboard has no file(s). Called from main-process IPC handlers
+// (clipboard is only fully available here, with any raw pasteboard UTI).
+
+// Resolve a `/.file/id=<fsid>.<objid>` path to a real POSIX path. macOS Finder,
+// when copying files from a TCC-protected location (Desktop/Documents/
+// Downloads), places a 'public.file-url' whose value is
+// `file:///.file/id=<fsid>.<objid>` — a VFS file-id promise, NOT a real path.
+// stat/realpath fail with ENOTDIR. NSURL can resolve such IDs via Foundation,
+// so we shell out to osascript (~80ms). Best-effort: if resolution fails we
+// return null (caller skips the path, the lossy text-only clipboard then acts
+// as a fallback xterm paste).
+function _resolveFileIdPath(fileIdPath) {
+  // file-id paths are fsid-size bounded ascii; ensure the path is well-formed.
+  if (typeof fileIdPath !== 'string' || fileIdPath.indexOf('/.file/id=') !== 0) return null;
+  try {
+    // posix-shell escape around the Applescript string literal; fileIdPath
+    // is ascii-safe, so a backslash-and-double-quote escape is enough. The
+    // pipe-quote `|NSURL|` is mandatory on modern macOS (AppleScript-ObjC
+    // bridge treats unescaped `NSURL` as a reserved token) and the argument
+    // must be wrapped in parens — bare `fileURLWithPath:"…"` confuses the
+    // parser. See forum.latenightsw.com archive for the gotcha.
+    const escaped = fileIdPath.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+    // osascript wants each `-e` argument to be one logical line.
+    const lines = [
+      'use AppleScript version "2.4"',
+      'use framework "Foundation"',
+      'use scripting additions',
+      'set nsurl to current application\'s |NSURL|\'s fileURLWithPath:("' + escaped + '")',
+      'set resolved to nsurl\'s URLByResolvingSymlinksInPath()',
+      'if resolved is missing value then return ""',
+      'return (resolved\'s |path|() as text)',
+    ];
+    const args = [];
+    for (const l of lines) { args.push('-e'); args.push(l); }
+    const result = execFileSync('osascript', args, {
+      encoding: 'utf8', timeout: 1500, stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    const p = String(result || '').trim();
+    return p && p.charAt(0) === '/' ? p : null;
+  } catch (_e) { return null; }
+}
+
+function _readClipboardFilesList() {
+  const out = [];
+  try {
+    // The list of formats Finder actually writes for a copied file. Try them in
+    // order — 'public.file-url' (the modern UTI) then the legacy Cocoa type.
+    const fmts = ['public.file-url', 'NSFilenamesPboardType', 'public/file-url'];
+    let used = null, buf = null;
+    for (const f of fmts) {
+      try { if (clipboard.has(f)) { buf = clipboard.readBuffer(f); used = f; break; } }
+      catch (_e) {}
+    }
+    if (!buf || buf.length === 0) return out;
+    const raw = buf.toString('utf8');
+      if (used === 'NSFilenamesPboardType') {
+      // NeXT plist NSArray of NSString file paths:
+      //   <array><string>/abs/path1</string><string>/abs/path2</string>…</array>
+      const ms = raw.match(/<string>([^<]+)<\/string>/g) || [];
+      for (const s of ms) {
+        const m = s.match(/^<string>([^<]+)<\/string>$/);
+        if (m) out.push(m[1]);
+      }
+      if (out.length === 0 && raw.trim()) out.push(raw.trim());
+      return out;
+    }
+    if (used === 'public.file-url' || used === 'public/file-url') {
+      // 'public.file-url' → one file:// URL per line.
+      // NOTE: on modern macOS, copying a file from a TCC-protected location
+      // (Desktop, Documents, Downloads) yields a file-id promise URL of the
+      // form `file:///.file/id=<fsid>.<objid>` rather than a real path.
+      // `fs.realpath()` / `stat()` return ENOTDIR on /.file/id=… — macOS doesn't
+      // resolve it through the legacy filesystem path VFS, only through NSURL /
+      // the file-id promise API. We ask Finder/Foundation to resolve such IDs
+      // via NSURL.URLByResolvingSymlinksInPath (a Foundation call wrapped in a
+      // one-shot osascript); other file:// URLs are decoded directly.
+      const out2 = [];
+      for (const line of raw.split(/[\r\n]+/)) {
+        const t = line.trim();
+        if (!t) continue;
+        let p = null;
+        try { p = decodeURIComponent(new URL(t).pathname); }
+        catch (_e) { if (t.indexOf('file://') === 0) p = t.slice(7); }
+        if (!p) continue;
+        if (p.indexOf('/.file/id=') === 0) {
+          const resolved = _resolveFileIdPath(p);
+          if (resolved) out2.push(resolved);
+        } else {
+          out2.push(p);
+        }
+      }
+      return out2.length ? out2 : out;
+    }
+  } catch (_e) { /* leave out empty — caller falls back to plain text */ }
+  return out;
+}
 
 let serverProc = null;
 let win = null;
@@ -162,6 +263,25 @@ function registerIpc() {
     });
     if (res.canceled || !res.filePaths || !res.filePaths.length) return null;
     return res.filePaths[0];
+  });
+  // Read the absolute filesystem path(s) of file(s) currently in the system
+  // clipboard — Finder's ⌘C writes a `public.file-url` (UTI 'furl') slot, plus a
+  // lossy filename string. The renderer can't see this from a sandboxed /
+  // contextIsolated renderer (browser Clipboard API strips the file:// URL);
+  // the clipboard module is fully available from the MAIN process with any
+  // raw pasteboard format, so we read it here and return []string of POSIX
+  // paths. The in-app terminal pane calls this on ⌘V and pastes the quoted
+  // paths into the running shell — same UX as dragging a Finder file.
+  //
+  // Reads NSFilenamesPboardType (legacy macOS serialised NSArray of NSString
+  // paths wrapped in <array><string>…</string></array>).
+  ipcMain.handle('codbash:read-clipboard-files', function () {
+    return _readClipboardFilesList();
+  });
+  // SYNC variant for serve-renderer: attachCustomKeyEventHandler is synchronous
+  // (must return a boolean, not a Promise); ipcRenderer.invoke would not suffice.
+  ipcMain.on('codbash:read-clipboard-files-sync', function (event) {
+    event.returnValue = _readClipboardFilesList();
   });
   // The renderer decides a shortcut had no in-page meaning (e.g. Cmd+W outside
   // the Workspace) and asks us to close the window instead.
