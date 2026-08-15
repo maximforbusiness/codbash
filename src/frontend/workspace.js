@@ -611,6 +611,11 @@ function _wsConnectPane(pane) {
   host.addEventListener('focusin', function () { _wsSetFocusedPane(pane.id); });
   host.addEventListener('mousedown', function () { _wsSetFocusedPane(pane.id); });
 
+  // Allow dropping Finder files / browser links straight onto the terminal —
+  // the path (or URL) is pasted onto the prompt, quoted for POSIX. See
+  // _wsAttachDropTarget for behaviour and rationale.
+  _wsAttachDropTarget(host, term, pane);
+
   var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   var url = proto + '//' + location.host + '/ws/terminal' +
     '?token=' + encodeURIComponent(_wsToken) + '&cols=' + term.cols + '&rows=' + term.rows +
@@ -1520,6 +1525,105 @@ function addWorkspaceTab() {
 function _wsProjectBasename(p) {
   if (!p) return '';
   return String(p).replace(/[\/\\]+$/, '').split(/[\/\\]/).pop() || String(p);
+}
+
+// ── Drag & drop files / URLs onto a terminal pane ───────────────────────────
+// The in-app terminal used to swallow drags from Finder / the browser: xterm's
+// own mouse handlers + Electron's default behaviour turned any dropped file
+// into a navigated-to-localhost URL (or nothing at all). For an agent workflow
+// what the user almost always wants is much simpler — just have the *path*
+// (or the URL / pasted text) appear on the shell prompt, quoted for POSIX, so
+// the running agent can read the file or follow the link itself. No uploading
+// of file contents is needed.
+//
+// We attach dragover + drop handlers to the xterm host element:
+//   * dragover  — preventDefault is MANDATORY or the browser shows the
+//     "no-drop" cursor and cancels; we also set dropEffect='copy' so the UI
+//     looks consistent.
+//   * drop      — we do preventDefault (so the browser doesn't navigate to
+//     the dropped file's URL), then collect items in preference order:
+//       1. files (Finder drag) — resolve each to an absolute POSIX path.
+//          Electron's File object still carries the real path on the `path`
+//          property even with contextIsolation:true / nodeIntegration:false
+//          (so long as webSecurity stays on, which it does in desktop/main.js).
+//          We read `file.path` first and fall back to `file.name` if it is not
+//          populated (e.g. in a strict future Electron build).
+//       2. URL/text links (browser drag) — paste as-is, no shell quoting: an
+//          https://… link passed to an agent is a reference, not a CLI argv.
+//     Items are joined with a single space and inserted as one chunk via
+//     term.paste(text), which routes through xterm's onData → our WebSocket →
+//     the pty, identical to typing. We send one combined string (with a
+//     trailing space) instead of one event per item so the running program
+//     sees them as separate argv words on the same prompt line.
+//
+// Shell-quoting (`_wsShellQuote`) wraps any path that contains shell
+// metacharacters in single quotes and escapes embedded apostrophes (the posix
+// '\'' idiom) — a simple `/foo bar/bug's.txt` becomes `'/foo bar/bug'\''s.txt'`,
+// safe to paste into both bash and zsh. Pure-ascii clean paths are passed
+// unquoted so `cd /Users/me/proj` looks as the user typed it.
+function _wsShellQuote(p) {
+  var s = String(p == null ? '' : p);
+  if (s === '') return "''";
+  // No shell metacharacters → leave it alone (cd /Users/me/proj stays clean).
+  if (/^[A-Za-z0-9_\-./@:=+,%]+$/.test(s)) return s;
+  // Wrap in single quotes; the only character that breaks a single-quoted
+  // posix string is the apostrophe itself — escape it via the '\'' idiom
+  // (close-quote, escaped apostrophe, open-quote).
+  return "'" + s.replace(/'/g, "'\\''") + "'";
+}
+
+function _wsAttachDropTarget(host, term, pane) {
+  if (!host || !term) return;
+  host.addEventListener('dragover', function (e) {
+    e.preventDefault();
+    e.stopPropagation();   // stop the document-level guard so our 'copy' dropEffect wins
+    try { e.dataTransfer.dropEffect = 'copy'; } catch (_e) {}
+  }, false);
+  host.addEventListener('dragenter', function (e) {
+    e.preventDefault();
+    e.stopPropagation();
+    try { e.dataTransfer.dropEffect = 'copy'; } catch (_e) {}
+  }, false);
+  host.addEventListener('drop', function (e) {
+    e.preventDefault();
+    e.stopPropagation();
+    var parts = [];
+    var dt = e.dataTransfer;
+    if (dt) {
+      // Files first — Finder / macOS file drags. In Electron the File object
+      // carries the absolute path on `.path`; if a future build strips that,
+      // `.name` is a weaker but still-often-usable fallback.
+      var files = dt.files;
+      if (files && files.length) {
+        for (var i = 0; i < files.length; i++) {
+          var f = files[i];
+          var p = (f && typeof f.path === 'string') ? f.path
+                : (f && f.name ? f.name : null);
+          if (p) parts.push(_wsShellQuote(p));
+        }
+      }
+      // If no files, treat as a link/text drop (browser address-bar drag, a
+      // selected text snippet). Don't shell-quote these — an https:// URL is a
+      // reference for the agent to read, not an argv the shell needs to parse.
+      if (parts.length === 0) {
+        var link = null;
+        try { link = dt.getData('text/uri-list'); } catch (_e) {}
+        if (!link) { try { link = dt.getData('text/plain'); } catch (_e) {} }
+        if (link === null || link === undefined) link = '';
+        link = String(link).trim();
+        if (link) parts.push(link);
+      }
+    }
+    if (parts.length) {
+      // Trailing space so the dropped text doesn't visually merge with the
+      // next prompt word; we don't add a newline so the user can Edit/review
+      // before pressing Enter (matching the prefill-style UX for resumes).
+      var out = parts.join(' ') + ' ';
+      try { if (pane && pane.term) pane.term.focus(); } catch (_e) {}
+      try { term.paste(out); } catch (_e) {}
+      try { _wsSetFocusedPane(pane && pane.id); } catch (_e) {}
+    }
+  }, false);
 }
 
 // Give a terminal a meaningful name automatically: when a pane connects and
