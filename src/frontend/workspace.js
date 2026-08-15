@@ -703,6 +703,41 @@ function _wsConnectPane(pane) {
       if (sock.readyState === 1) sock.send(enc.encode('\x1b\r'));
       return false;
     }
+    // ⌘V / Ctrl+Shift+V (also Ctrl+V on macOS as a fallback): if the system
+    // clipboard holds a file copied from Finder (or a directory), paste its
+    // ABSOLUTE POSIX PATH into the terminal — quoted, just like a drag&drop.
+    // Without this the renderer keyboard handler would just write Finder's
+    // lossy `public.utf8-plain-text` representation (usually a bare filename,
+    // which the running agent can't locate). contextBridge exposes
+    // window.codbashDesktop.readClipboardFilePaths() — see desktop/preload.js
+    // for the clipboard.readBuffer('public/file-url') plumbing.
+    if (e.type === 'keydown' && (e.key === 'v' || e.key === 'V') && !e.altKey) {
+      var modV = e.metaKey || (e.ctrlKey && e.shiftKey) || (e.metaKey === false && e.ctrlKey && e.shiftKey);
+      // Normalize: ⌘+V on macOS, Ctrl+Shift+V on Linux (xterm default for
+      // paste), and accept either with or without Shift.
+      var isPaste = (e.metaKey && !e.altKey) || (e.ctrlKey && e.shiftKey);
+      if (isPaste && window.codbashDesktop && typeof window.codbashDesktop.readClipboardFilePaths === 'function') {
+        try {
+          var paths = window.codbashDesktop.readClipboardFilePaths();
+          if (paths && paths.length) {
+            var quoted = [];
+            for (var pi = 0; pi < paths.length; pi++) {
+              var pp = paths[pi];
+              if (pp) quoted.push(_wsShellQuote(pp));
+            }
+            if (quoted.length) {
+              // Single trailing space (no newline) so the user can Edit/Enter.
+              var pasted = quoted.join(' ') + ' ';
+              try { term.paste(pasted); } catch (_e) {}
+              // Swallow the keystroke: we handled it. Return false so xterm
+              // does not also paste the lossy text clipboard contents behind
+              // our back (it would insert the bare filename).
+              return false;
+            }
+          }
+        } catch (_e) { /* fall through → normal xterm paste */ }
+      }
+    }
     return true;
   });
 
