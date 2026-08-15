@@ -303,8 +303,36 @@ function openInTerminal(sessionId, tool, flags, projectDir, terminalId, mode, co
   // Windows/WSL launch paths don't use this — they have their own process-tree
   // management via Start-Process / wt.exe.
   const wrappedFull = process.platform === 'darwin' ? reapWrapPosix(fullCmd) : fullCmd;
+  // ── macOS AppleScript embedding escape ────────────────────────────
+  // Previously we embedded wrappedFull directly into an AppleScript string
+  // (`do script "${escapedCmd}"`) where escapedCmd = fullCmd.replace(/"/g,'\\"').
+  // That KO'd both shell-single-quote escaping (reaper's '"'"' tokens closed
+  // the OUTER shell single quote of `osascript -e '...'`) AND AppleScript's own
+  // string escaping (`\"` is not valid inside an AppleScript literal on modern
+  // macOS; osascript threw -2741 syntax errors). Switched to execFileSync so the
+  // shell is out of the picture, but recovered: AppleScript strings still can't
+  // contain literal `\"` safely — AppleScript offers no character-escape for
+  // `"` inside "…". The robust fix is to write wrappedFull to a wrapper .sh
+  // file (mode 0700) and have AppleScript `do script` just exec THAT path,
+  // which contains only ASCII and zero inner quotes.
+  let launcherPath = null;
+  if (process.platform === 'darwin' && wrappedFull !== fullCmd) {
+    try {
+      const osTmp = path.join(os.tmpdir(), 'codbash-launch');
+      fs.mkdirSync(osTmp, { recursive: true });
+      launcherPath = path.join(osTmp, `run_${Date.now()}_${process.pid}.sh`);
+      fs.writeFileSync(launcherPath, `#!/bin/sh\n${wrappedFull}\n`, { mode: 0o700 });
+    } catch (e) {
+      termLog('TERM', `openInTerminal: WARN failed to stage launcher .sh (${e.message}); falling back to inline escapedCmd`);
+      launcherPath = null;
+    }
+  }
+  // Fallback (non-darwin, or staging failure) keeps the legacy escaped form.
   const escapedCmd = wrappedFull.replace(/"/g, '\\"');
-  termLog('TERM', `openInTerminal: terminal=${terminalId || 'default'} tool=${tool} cmd="${fullCmd}"${wrappedFull !== fullCmd ? ' [reap-wrapped]' : ''}`);
+  // Whether to use the temp-script trick. When available, AppleScripts pass
+  // launcherPath as the `do script` argument (ASCII-only, zero-quote).
+  const doScriptArg = launcherPath || escapedCmd;
+  termLog('TERM', `openInTerminal: terminal=${terminalId || 'default'} tool=${tool} cmd="${fullCmd}"${wrappedFull !== fullCmd ? ' [reap-wrapped]' : ''}${launcherPath ? ' [staged:'+launcherPath+']' : ''}`);
 
   const platform = process.platform;
 
@@ -327,9 +355,9 @@ function openInTerminal(sessionId, tool, flags, projectDir, terminalId, mode, co
         const termScript = `tell application "Terminal"
   activate
   if (count of windows) > 0 then
-    tell front window to do script "${escapedCmd}"
+    tell front window to do script "${doScriptArg}"
   else
-    do script "${escapedCmd}"
+    do script "${doScriptArg}"
   end if
 end tell`;
         try {
@@ -338,7 +366,7 @@ end tell`;
           // Fallback: plain new window.
           const fallbackScript = `tell application "Terminal"
   activate
-  do script "${escapedCmd}"
+  do script "${doScriptArg}"
 end tell`;
           try { execFileSync('osascript', ['-e', fallbackScript], { stdio: 'pipe' }); }
           catch (_e) { /* last-ditch below */ }
@@ -366,7 +394,7 @@ end tell`;
           execSync(`open "warp://launch/${warpConfigName}"`, { stdio: 'pipe', timeout: 3000 });
         } catch {
           // Fallback to Terminal.app
-          execFileSync('osascript', ['-e', `tell application "Terminal" to do script "${escapedCmd}"`], { stdio: 'pipe' });
+          execFileSync('osascript', ['-e', `tell application "Terminal" to do script "${doScriptArg}"`], { stdio: 'pipe' });
         }
         setTimeout(() => { try { fs.unlinkSync(warpConfigPath); } catch {} }, 3000);
         break;
@@ -408,13 +436,13 @@ end tell`;
               tell current window
                 set newTab to (create tab with default profile)
                 tell newTab
-                  write text "${escapedCmd}"
+                  write text "${doScriptArg}"
                 end tell
               end tell
             else
               set newWindow to (create window with default profile)
               tell current session of newWindow
-                write text "${escapedCmd}"
+                write text "${doScriptArg}"
               end tell
             end if
           end tell
@@ -426,20 +454,28 @@ end tell`;
           const termFallbackPreferTab = `tell application "Terminal"
   activate
   if (count of windows) > 0 then
-    tell front window to do script "${escapedCmd}"
+    tell front window to do script "${doScriptArg}"
   else
-    do script "${escapedCmd}"
+    do script "${doScriptArg}"
   end if
 end tell`;
           try {
             execFileSync('osascript', ['-e', termFallbackPreferTab], { stdio: 'pipe' });
           } catch (_e) {
-            try { execFileSync('osascript', ['-e', `tell application "Terminal" to do script "${escapedCmd}"`], { stdio: 'pipe' }); }
+            try { execFileSync('osascript', ['-e', `tell application "Terminal" to do script "${doScriptArg}"`], { stdio: 'pipe' }); }
             catch (_e2) { /* give up */ }
           }
         }
         break;
       }
+    }
+    // Cleanup staged launcher .sh after a generous grace — Terminal.app's new
+    // tab executes the file synchronously at open; by the time the shell loads
+    // and starts running it (1-3s), the file is already open. 60s is more than
+    // enough; meanwhile the new shell keeps using the script.
+    if (launcherPath) {
+      const _lp = launcherPath;
+      setTimeout(() => { try { fs.unlinkSync(_lp); } catch {} }, 60000);
     }
   } else if (platform === 'linux' && isWSL()) {
     let effectiveSessionId = sessionId;
