@@ -310,27 +310,41 @@ function openInTerminal(sessionId, tool, flags, projectDir, terminalId, mode, co
 
   if (platform === 'darwin') {
     switch (terminalId) {
-      case 'terminal':
+      case 'terminal': {
         // Open as a new TAB in the current window if possible, otherwise a new window.
         // 'do script' without a target defaults to the frontmost window's tab;
         // we tell it explicitly so osascript doesn't pick a background one.
+        //
+        // We pass the osascript as an argv-style call to execFileSync().
+        // Using execSync(`osascript -e '...'`) with escapedCmd inside single-
+        // quoted shell args BROKES: escapedCmd legitimately contains single
+        // quotes (the reaper wrapper is `sh -c '... wait'`), which terminate
+        // the shell's outer single-quote and produce osascript syntax errors
+        // (-2741) and the mangled `wait"` segment "command not found",
+        // breaking ⌘V/native-terminal resume path. execFileSync bypasses the
+        // shell entirely, so the script string is passed VERBATIM to osascript
+        // — every inner single/double quote is preserved.
+        const termScript = `tell application "Terminal"
+  activate
+  if (count of windows) > 0 then
+    tell front window to do script "${escapedCmd}"
+  else
+    do script "${escapedCmd}"
+  end if
+end tell`;
         try {
-          execSync(`osascript -e 'tell application "Terminal"
-            activate
-            if (count of windows) > 0 then
-              tell front window to do script "${escapedCmd}"
-            else
-              do script "${escapedCmd}"
-            end if
-          end tell'`);
+          execFileSync('osascript', ['-e', termScript], { stdio: 'pipe' });
         } catch {
           // Fallback: plain new window.
-          execSync(`osascript -e 'tell application "Terminal"
-            activate
-            do script "${escapedCmd}"
-          end tell'`);
+          const fallbackScript = `tell application "Terminal"
+  activate
+  do script "${escapedCmd}"
+end tell`;
+          try { execFileSync('osascript', ['-e', fallbackScript], { stdio: 'pipe' }); }
+          catch (_e) { /* last-ditch below */ }
         }
         break;
+      }
       case 'warp': {
         // Warp Launch Configurations API — write temp YAML, open via URI scheme
         const warpConfigDir = path.join(os.homedir(), '.warp', 'launch_configurations');
@@ -352,7 +366,7 @@ function openInTerminal(sessionId, tool, flags, projectDir, terminalId, mode, co
           execSync(`open "warp://launch/${warpConfigName}"`, { stdio: 'pipe', timeout: 3000 });
         } catch {
           // Fallback to Terminal.app
-          execSync(`osascript -e 'tell application "Terminal" to do script "${escapedCmd}"'`);
+          execFileSync('osascript', ['-e', `tell application "Terminal" to do script "${escapedCmd}"`], { stdio: 'pipe' });
         }
         setTimeout(() => { try { fs.unlinkSync(warpConfigPath); } catch {} }, 3000);
         break;
@@ -406,20 +420,22 @@ function openInTerminal(sessionId, tool, flags, projectDir, terminalId, mode, co
           end tell
         `;
         try {
-          execSync(`osascript -e '${script.replace(/'/g, "'\\''")}'`, { stdio: 'pipe' });
+          execFileSync('osascript', ['-e', script], { stdio: 'pipe' });
         } catch {
           // Fallback to Terminal.app — prefer a tab in the front window.
+          const termFallbackPreferTab = `tell application "Terminal"
+  activate
+  if (count of windows) > 0 then
+    tell front window to do script "${escapedCmd}"
+  else
+    do script "${escapedCmd}"
+  end if
+end tell`;
           try {
-            execSync(`osascript -e 'tell application "Terminal"
-              activate
-              if (count of windows) > 0 then
-                tell front window to do script "${escapedCmd}"
-              else
-                do script "${escapedCmd}"
-              end if
-            end tell'`);
+            execFileSync('osascript', ['-e', termFallbackPreferTab], { stdio: 'pipe' });
           } catch (_e) {
-            execSync(`osascript -e 'tell application "Terminal" to do script "${escapedCmd}"'`);
+            try { execFileSync('osascript', ['-e', `tell application "Terminal" to do script "${escapedCmd}"`], { stdio: 'pipe' }); }
+            catch (_e2) { /* give up */ }
           }
         }
         break;
