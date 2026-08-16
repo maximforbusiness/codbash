@@ -255,6 +255,14 @@ function buildPosixShellCommand(cmd, projectDir) {
 // Safety: original `cmd` is single-quoted with `\'` escaping so shell
 // metacharacters in cmd (flags, session IDs) are inert — it's run verbatim.
 // If the command isn't an agent we recognise, we leave it untouched.
+//
+// IMPORTANT: this returns a ONE-LINE form suitable for use inside another
+// shell command's single/double quotes. When you instead need a STANDALONE
+// shell script body (e.g. when staging into a temp .sh file so osascript can
+// exec the ASCII-only path and avoid AppleScript string-escaping entirely),
+// use reapWrapPosixScriptLines() below — it returns the same semantics but as
+// safely-separated lines and WITHOUT any outer-shell quoting, so there are no
+// inner single/double quote escapes to confuse sh when the file is executed.
 function reapWrapPosix(fullCmd) {
   if (!/\b(pi|omp|claude|codex|qwen|kilo|kiro-cli|opencode|cursor-agent|gh copilot)\b/.test(fullCmd)) {
     return fullCmd;
@@ -294,6 +302,30 @@ function buildWindowsTerminalArgs(cmd, projectDir) {
   return args;
 }
 
+// Same semantics as reapWrapPosix() — install a SIGHUP/SIGTERM reaper before
+// running the agent, and `wait` for the agent so the tab stays open until it
+// exits — but returned as a multiline shell script body (with a #!/bin/sh shebang
+// + trailing newline) instead of a one-line `sh -c '…'` shell fragment.
+// Use this when you intend to stage the reaper into its own temp .sh file so
+// AppleScript / osascript can `do script /path/to/file` and pass only an
+// ASCII path through the AppleScript string (no inner-quote escaping).
+// The one-liner form from reapWrapPosix() cannot be written verbatim into a
+// .sh file because the outer `sh -c '…'` single quotes were parsed again
+// by /bin/sh when it loads the file, and the inner `"'"'` escape tokens only
+// work inside an outer single-quoted substr — on their own they collide with
+// the file's shebang line and produce `unexpected EOF while looking for matching
+// `''` syntax errors. Spelling each step out as its own line removes the need
+// for any inner-quote escapes entirely.
+function reapWrapPosixScriptLines(fullCmd) {
+  if (!/\b(pi|omp|claude|codex|qwen|kilo|kiro-cli|opencode|cursor-agent|gh copilot)\b/.test(fullCmd)) {
+    return null; // caller shouldn't have staged this
+  }
+  return "#!/bin/sh\n" +
+    "trap 'kill -TERM 0; sleep 2; kill -KILL 0; exit 127' HUP TERM\n" +
+    String(fullCmd) + "\n" +
+    "wait\n";
+}
+
 function openInTerminal(sessionId, tool, flags, projectDir, terminalId, mode, commandOverride, resumeTarget) {
   const cmd = buildAgentCommand(sessionId, tool, flags, mode, commandOverride, resumeTarget);
   const fullCmd = buildPosixShellCommand(cmd, projectDir);
@@ -321,7 +353,22 @@ function openInTerminal(sessionId, tool, flags, projectDir, terminalId, mode, co
       const osTmp = path.join(os.tmpdir(), 'codbash-launch');
       fs.mkdirSync(osTmp, { recursive: true });
       launcherPath = path.join(osTmp, `run_${Date.now()}_${process.pid}.sh`);
-      fs.writeFileSync(launcherPath, `#!/bin/sh\n${wrappedFull}\n`, { mode: 0o700 });
+      // ⚠️ DON'T write wrappedFull (the one-line `sh -c '…'` form) into the .sh
+      // file and exec it directly — /bin/sh re-parses the file top to bottom, so
+      // the outer `sh -c '…'` single-quoted substr loses its enclosing shell
+      // context and inner `"'"'` escape tokens collide with the shebang, giving
+      // `unexpected EOF while looking for matching '\'`. Instead emit each
+      // reaper step as its own line via reapWrapPosixScriptLines (trap, cd+agent,
+      // wait) — no inner quoting required, no `sh -c` wrap at all.
+      const scriptBody = reapWrapPosixScriptLines(fullCmd);
+      if (scriptBody) {
+        fs.writeFileSync(launcherPath, scriptBody, { mode: 0o700 });
+      } else {
+        // reapWrapPosixScriptLines returned null — agent regex didn't match;
+        // shouldn't happen because reapWrapPosix already gated it, but guard
+        // defensively by writing the unwrapped cmd as a fallback body.
+        fs.writeFileSync(launcherPath, `#!/bin/sh\n${fullCmd}\n`, { mode: 0o700 });
+      }
     } catch (e) {
       termLog('TERM', `openInTerminal: WARN failed to stage launcher .sh (${e.message}); falling back to inline escapedCmd`);
       launcherPath = null;
