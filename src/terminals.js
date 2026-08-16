@@ -387,36 +387,60 @@ function openInTerminal(sessionId, tool, flags, projectDir, terminalId, mode, co
     switch (terminalId) {
       case 'terminal': {
         // Open as a new TAB in the current window if possible, otherwise a new window.
-        // 'do script' without a target defaults to the frontmost window's tab;
-        // we tell it explicitly so osascript doesn't pick a background one.
         //
-        // We pass the osascript as an argv-style call to execFileSync().
-        // Using execSync(`osascript -e '...'`) with escapedCmd inside single-
-        // quoted shell args BROKES: escapedCmd legitimately contains single
-        // quotes (the reaper wrapper is `sh -c '... wait'`), which terminate
-        // the shell's outer single-quote and produce osascript syntax errors
-        // (-2741) and the mangled `wait"` segment "command not found",
-        // breaking ⌘V/native-terminal resume path. execFileSync bypasses the
-        // shell entirely, so the script string is passed VERBATIM to osascript
-        // — every inner single/double quote is preserved.
+        // Caveat: `do script` in Terminal.app creates a NEW WINDOW (not a tab in
+        // the front window), regardless of `tell front window to do script …` —
+        // verified against factory Terminal.app settings on modern macOS. The
+        // AppleScript dictionary exposes no 'make new tab' selector either.
+        // The ONLY reliable way to open a tab in an existing window is to
+        // synthesize ⌘T via System Events (Accessibility). That requires
+        // 'codbash' (really, the embedding parent process) to hold the
+        // 'Accessibility' TCC permission; if it doesn't, osascript returns
+        // errAEEventNotHandled (-10000) or 'not allowed assistive' (-1743),
+        // and we fall back to the classic `do script` (which opens a window).
+        //
+        // We pass osascript argv-style via execFileSync() (a single -e arg)
+        // so the shell is bypassed — every inner quote in doScriptArg is
+        // preserved. That also matters for the inline AppleScript string
+        // escape; doScriptArg only ever contains ASCII (a /tmp/…/run_*.sh
+        // path) once the reaper stage succeeded.
         const termScript = `tell application "Terminal"
   activate
   if (count of windows) > 0 then
-    tell front window to do script "${doScriptArg}"
-  else
-    do script "${doScriptArg}"
+    set w to front window
+    set index of w to 1
   end if
-end tell`;
+end tell
+delay 0.2
+if (count of windows of application "Terminal") > 0 then
+  tell application "System Events"
+    keystroke "t" using command down
+  end tell
+  delay 0.4
+  tell application "Terminal"
+    activate
+    set t to selected tab of front window
+    do script "${doScriptArg}" in t
+  end tell
+else
+  -- No existing window; a plain do script will open one.
+  tell application "Terminal"
+    activate
+    do script "${doScriptArg}"
+  end tell
+end if`;
         try {
-          execFileSync('osascript', ['-e', termScript], { stdio: 'pipe' });
-        } catch {
-          // Fallback: plain new window.
+          execFileSync('osascript', ['-e', termScript], { stdio: 'pipe', timeout: 5000 });
+        } catch (_e1) {
+          // Fall back: classic `do script` — opens a new window. This is also
+          // the path taken when the user has NOT granted Accessibility so the
+          // ⌘T keystroke path hit errAEEventNotHandled.
           const fallbackScript = `tell application "Terminal"
   activate
   do script "${doScriptArg}"
 end tell`;
-          try { execFileSync('osascript', ['-e', fallbackScript], { stdio: 'pipe' }); }
-          catch (_e) { /* last-ditch below */ }
+          try { execFileSync('osascript', ['-e', fallbackScript], { stdio: 'pipe', timeout: 5000 }); }
+          catch (_e2) { /* last-ditch: give up silently */ }
         }
         break;
       }
