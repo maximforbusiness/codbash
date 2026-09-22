@@ -819,8 +819,11 @@ function _wsResumeVariant(cmd) {
     // keeping any other flags (e.g. --dangerously-skip-permissions).
     case 'claude':
     case 'claude-ext': return env + s + ' --continue';
-    // Codex only resumes via a subcommand; safe when launched bare (`codex`).
-    case 'codex': return env + (s === 'codex' ? 'codex resume --last' : s);
+    // Codex resumes via `codex resume --last`, preserving any extra flags.
+    case 'codex': {
+      var rest = s.slice(word.length).trim();
+      return env + 'codex resume --last' + (rest ? ' ' + rest : '');
+    }
     default: return env + s;
   }
 }
@@ -968,7 +971,14 @@ function openBookmark(id) {
   _wsCloseBmMenu();
   var b = _wsBookmarks.find(function (x) { return x.id === id; });
   if (!b) return;
-  openInWorkspace({ name: b.label || _wsProjectBasename(b.cwd), cwd: b.cwd || null, cmd: b.cmd || null });
+  var runCmd = b.cmd || null;
+  // If the bookmark saved a bare agent command like "codex" or "claude",
+  // transform it to resume the latest conversation in that directory
+  // so opening the bookmark continues the session instead of starting blank.
+  if (runCmd && typeof _wsResumeVariant === 'function') {
+    runCmd = _wsResumeVariant(runCmd);
+  }
+  openInWorkspace({ name: b.label || _wsProjectBasename(b.cwd), cwd: b.cwd || null, cmd: runCmd });
 }
 
 // Save a bookmark from a pane (its folder + the agent command it launched).
