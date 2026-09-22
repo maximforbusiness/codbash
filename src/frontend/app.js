@@ -10,17 +10,30 @@ let allSessions = [];
 // dropped onto the page and no element preventDefault's the drop. Inside an
 // in-app browser that's almost always wrong (the user dragged a file from
 // Finder meaning to paste its path into a terminal, not to open the file
-// inside codbash), and in the worst case it would reload the page and discard
-// the running session's state. Each workspace terminal host calls
-// stopPropagation() after its own drop handler, so a drop *onto a terminal*
-// never reaches these document-level listeners — they only fire for drops
-// elsewhere on the page, where we still want to block the navigate-to-file
-// default but otherwise do nothing.
+// inside codbash).
+// IMPORTANT: We only want to block OS *file* drops that missed a valid drop
+// target (like a terminal). We must NOT block internal in-app drag & drop
+// (such as dragging bookmark chips into groups or reordering tabs)!
 (function setupDragDropGuard() {
+  function isOsFileDrag(e) {
+    if (!e || !e.dataTransfer) return false;
+    var types = e.dataTransfer.types;
+    if (!types) return false;
+    for (var i = 0; i < types.length; i++) {
+      if (types[i] === 'Files') return true;
+    }
+    return false;
+  }
+
   function prevent(e) {
-    e.preventDefault();
-    e.stopPropagation();
-    if (e.dataTransfer) { try { e.dataTransfer.dropEffect = 'none'; } catch (_e) {} }
+    if (isOsFileDrag(e)) {
+      var isTerminalHost = e.target && e.target.closest && e.target.closest('.ws-term-host');
+      if (!isTerminalHost) {
+        e.preventDefault();
+        e.stopPropagation();
+        if (e.dataTransfer) { try { e.dataTransfer.dropEffect = 'none'; } catch (_e) {} }
+      }
+    }
   }
   document.addEventListener('dragover', prevent, false);
   document.addEventListener('drop', prevent, false);

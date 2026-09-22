@@ -2948,6 +2948,22 @@ body[data-view="overview"] .toolbar { display: none; }
 .ws-bmf-out:hover { opacity: 1; background: color-mix(in srgb, var(--text-secondary) 20%, transparent); color: var(--text-primary); }
 .ws-bmf-x:hover { opacity: 1; background: color-mix(in srgb, var(--accent-red) 22%, transparent); color: var(--accent-red); }
 .ws-bmf-empty { padding: 14px 8px; text-align: center; color: var(--text-muted); font-size: 11px; }
+.ws-bmf-actions { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--border); }
+.ws-bmf-act-btn {
+    width: 100%; text-align: left; padding: 5px 8px; font-size: 11px; cursor: pointer;
+    background: transparent; color: var(--accent-blue); border: 1px dashed color-mix(in srgb, var(--accent-blue) 40%, transparent);
+    border-radius: 6px; transition: background 0.12s ease;
+}
+.ws-bmf-act-btn:hover { background: color-mix(in srgb, var(--accent-blue) 12%, transparent); border-style: solid; }
+.ws-bm-folder-pick {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 14px; height: 14px; border-radius: 3px; font-size: 9px;
+    color: var(--text-muted); opacity: 0; transition: opacity 0.12s ease;
+    margin-left: -2px; margin-right: 2px;
+}
+.ws-bm:hover .ws-bm-folder-pick { opacity: 0.7; }
+.ws-bm-folder-pick:hover { opacity: 1; color: var(--accent-blue); background: color-mix(in srgb, var(--accent-blue) 20%, transparent); }
+.ws-bm-pick-menu { width: 200px; padding: 4px; }
 .ws-bmf-foot { display: flex; gap: 6px; margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--border); }
 .ws-bmf-foot button {
     flex: 1; padding: 6px 8px; font-size: 11px; cursor: pointer;

@@ -915,6 +915,10 @@ function _wsBmChipHtml(b) {
   var sub = b.cmd ? _wsBmAgentWord(b.cmd) : (_wsShortCwd(b.cwd) || 'shell');
   var tip = (b.cwd || '') + (b.cmd ? '  —  ' + _wsMaskSecrets(b.cmd) : '');
   var id = escHtml(b.id);
+  var folderBtn = '';
+  if (_wsBmFolders.length) {
+    folderBtn = '<span class="ws-bm-folder-pick" title="Move to group..." onclick="event.stopPropagation();_wsPickBmFolder(event,\'' + id + '\')">▾</span>';
+  }
   return '' +
     '<button class="ws-bm" data-bm-id="' + id + '" title="' + escHtml(tip) + '" draggable="true" ' +
       'ondragstart="wsBmDragStart(event,\'' + id + '\')" ondragend="wsBmDragEnd(event)" ' +
@@ -922,6 +926,7 @@ function _wsBmChipHtml(b) {
       '<span class="ws-bm-dot" style="background:' + escHtml(b.color || '#3b82f6') + '"></span>' +
       '<span class="ws-bm-label">' + escHtml(b.label || _wsProjectBasename(b.cwd) || 'shell') + '</span>' +
       '<span class="ws-bm-sub">' + escHtml(sub) + '</span>' +
+      folderBtn +
       '<span class="ws-bm-x" title="Remove bookmark" onclick="event.stopPropagation();removeBookmark(\'' + id + '\')">&times;</span>' +
     '</button>';
 }
@@ -1059,23 +1064,140 @@ function moveBookmarkToFolder(bmId, folderId) {
 
 // Drag a bookmark chip onto a folder to file it there.
 var _wsDragBmId = null;
-function wsBmDragStart(e, id) { _wsDragBmId = id; try { e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('text/plain', id); } catch (_e) {} }
+function wsBmDragStart(e, id) {
+  _wsDragBmId = id;
+  if (e && e.dataTransfer) {
+    try {
+      e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer.setData('text/plain', id);
+      e.dataTransfer.setData('application/x-codbash-bm', id);
+    } catch (_e) {}
+  }
+}
 function wsBmDragEnd(e) {
   _wsDragBmId = null;
   var bar = document.getElementById('wsBookmarks');
   if (bar) Array.prototype.slice.call(bar.querySelectorAll('.drop-target')).forEach(function (x) { x.classList.remove('drop-target'); });
 }
 function wsBmDragOverFolder(e, fid) {
-  if (!_wsDragBmId) return;
   e.preventDefault();
-  try { e.dataTransfer.dropEffect = 'move'; } catch (_e) {}
+  if (e && e.dataTransfer) {
+    try { e.dataTransfer.dropEffect = 'move'; } catch (_e) {}
+  }
   if (e.currentTarget) e.currentTarget.classList.add('drop-target');
 }
 function wsBmDragLeaveFolder(e) { if (e.currentTarget) e.currentTarget.classList.remove('drop-target'); }
 function wsBmDropOnFolder(e, fid) {
   e.preventDefault();
   if (e.currentTarget) e.currentTarget.classList.remove('drop-target');
-  if (_wsDragBmId) { moveBookmarkToFolder(_wsDragBmId, fid); _wsDragBmId = null; }
+  var bId = _wsDragBmId;
+  if (!bId && e && e.dataTransfer) {
+    try { bId = e.dataTransfer.getData('application/x-codbash-bm') || e.dataTransfer.getData('text/plain'); } catch (_e) {}
+  }
+  if (bId) {
+    moveBookmarkToFolder(bId, fid);
+    _wsDragBmId = null;
+  }
+}
+
+// Quick picker dropdown to move a bookmark to any group or loose
+function _wsPickBmFolder(ev, bmId) {
+  if (ev) ev.stopPropagation();
+  var existing = document.getElementById('wsBmPickMenu');
+  if (existing) { existing.remove(); return; }
+  var b = _wsBookmarks.find(function (x) { return x.id === bmId; });
+  if (!b) return;
+  var m = document.createElement('div');
+  m.id = 'wsBmPickMenu';
+  m.className = 'ws-bmf-menu ws-bm-pick-menu';
+  var list = '<div style="font-size:11px;font-weight:600;color:var(--text-muted);padding:4px 8px 6px;">Move to group:</div>';
+  if (b.folderId) {
+    list += '<div class="ws-bmf-item" onclick="moveBookmarkToFolder(\'' + bmId + '\', \'\');document.getElementById(\'wsBmPickMenu\').remove();">' +
+      '<span class="ws-bmf-label">↳ Loose (no group)</span></div>';
+  }
+  _wsBmFolders.forEach(function (f) {
+    if (f.id === b.folderId) return;
+    list += '<div class="ws-bmf-item" onclick="moveBookmarkToFolder(\'' + bmId + '\', \'' + f.id + '\');document.getElementById(\'wsBmPickMenu\').remove();">' +
+      '<span class="ws-bm-dot" style="background:' + escHtml(f.color || '#f59e0b') + '"></span>' +
+      '<span class="ws-bmf-label">' + escHtml(f.name) + '</span></div>';
+  });
+  m.innerHTML = '<div class="ws-bmf-list">' + list + '</div>';
+  document.body.appendChild(m);
+  var btn = ev && ev.currentTarget;
+  if (btn && btn.getBoundingClientRect) {
+    var r = btn.getBoundingClientRect();
+    m.style.top = (r.bottom + 4) + 'px';
+    m.style.left = Math.max(10, Math.min(r.left - 40, window.innerWidth - 220)) + 'px';
+  }
+  setTimeout(function () {
+    function off(e) { if (!m.contains(e.target)) { m.remove(); document.removeEventListener('mousedown', off); } }
+    document.addEventListener('mousedown', off);
+  }, 0);
+}
+
+// Add the currently active terminal directly to a specific folder
+function addBookmarkToFolder(folderId) {
+  var pane = (_wsFocusedPaneId && _wsFindPane(_wsFocusedPaneId));
+  if (!pane) { var t = _wsActiveTab(); pane = t && t.panes[0]; }
+  if (!pane) { showToast('No active terminal to bookmark'); return; }
+  var cwd = pane.cwd || pane.wantCwd || '';
+  var cmd = pane.cmd || pane.enteredCmd || pane.detectedCmd || '';
+  if (!cwd && !cmd) { showToast('Nothing to bookmark yet — open a folder or run an agent first'); return; }
+  var suggested = _wsProjectBasename(cwd) || _wsBmAgentWord(cmd) || 'bookmark';
+  var f = _wsBmFolder(folderId);
+  var groupName = f ? f.name : 'group';
+  codbashPrompt('Bookmark name for "' + groupName + '":', suggested).then(function (name) {
+    if (name == null) return;
+    name = String(name).trim() || suggested;
+    _wsBookmarks.push({
+      id: 'bm' + (++_wsPaneSeq),
+      label: name,
+      cwd: cwd,
+      cmd: cmd,
+      color: _wsBmNextColor(),
+      folderId: folderId
+    });
+    _wsSaveBookmarks();
+    _wsRenderBookmarks();
+    _wsRefreshBmMenu();
+    showToast('Added bookmark to "' + groupName + '"');
+  });
+}
+
+// Add an existing loose bookmark to a folder
+function addExistingToFolder(folderId) {
+  var loose = _wsBookmarks.filter(function (b) { return b.folderId !== folderId; });
+  if (!loose.length) {
+    showToast('No other bookmarks to add');
+    return;
+  }
+  var f = _wsBmFolder(folderId);
+  var groupName = f ? f.name : 'group';
+  var existing = document.getElementById('wsBmAddExistingMenu');
+  if (existing) existing.remove();
+  var m = document.createElement('div');
+  m.id = 'wsBmAddExistingMenu';
+  m.className = 'ws-bmf-menu ws-bm-pick-menu';
+  var list = '<div style="font-size:11px;font-weight:600;color:var(--text-muted);padding:4px 8px 6px;">Add bookmark to "' + escHtml(groupName) + '":</div>';
+  loose.forEach(function (b) {
+    list += '<div class="ws-bmf-item" onclick="moveBookmarkToFolder(\'' + b.id + '\', \'' + folderId + '\');document.getElementById(\'wsBmAddExistingMenu\').remove();">' +
+      '<span class="ws-bm-dot" style="background:' + escHtml(b.color || '#3b82f6') + '"></span>' +
+      '<span class="ws-bmf-label">' + escHtml(b.label || _wsProjectBasename(b.cwd) || 'shell') + '</span>' +
+      '<span class="ws-bmf-sub">' + escHtml(b.cmd ? _wsBmAgentWord(b.cmd) : (_wsShortCwd(b.cwd) || '')) + '</span>' +
+    '</div>';
+  });
+  m.innerHTML = '<div class="ws-bmf-list">' + list + '</div>';
+  document.body.appendChild(m);
+  var menu = document.getElementById('wsBmMenu');
+  if (menu && menu.getBoundingClientRect) {
+    var r = menu.getBoundingClientRect();
+    m.style.top = (r.bottom - 40) + 'px';
+    m.style.left = (r.left + 20) + 'px';
+  }
+  setTimeout(function () {
+    function off(e) { if (!m.contains(e.target)) { m.remove(); document.removeEventListener('mousedown', off); } }
+    document.addEventListener('mousedown', off);
+  }, 0);
 }
 
 // Folder dropdown menu (contents of a group).
@@ -1096,8 +1218,12 @@ function _wsBmMenuHtml(f) {
         '<span class="ws-bmf-out" title="Move out of group" onclick="event.stopPropagation();moveBookmarkToFolder(\'' + id + '\',\'\')">↤</span>' +
         '<span class="ws-bmf-x" title="Remove bookmark" onclick="event.stopPropagation();removeBookmark(\'' + id + '\')">&times;</span>' +
       '</div>';
-  }).join('') : '<div class="ws-bmf-empty">Empty — drag bookmarks here</div>';
+  }).join('') : '<div class="ws-bmf-empty">No bookmarks in this group yet</div>';
   return '<div class="ws-bmf-list">' + rows + '</div>' +
+    '<div class="ws-bmf-actions">' +
+      '<button class="ws-bmf-act-btn" onclick="addBookmarkToFolder(\'' + escHtml(f.id) + '\')">+ Add active terminal</button>' +
+      '<button class="ws-bmf-act-btn" onclick="addExistingToFolder(\'' + escHtml(f.id) + '\')">Add from bookmarks...</button>' +
+    '</div>' +
     '<div class="ws-bmf-foot">' +
       '<button onclick="renameBmFolder(\'' + escHtml(f.id) + '\')">Rename</button>' +
       '<button class="danger" onclick="deleteBmFolder(\'' + escHtml(f.id) + '\')">Delete group</button>' +
