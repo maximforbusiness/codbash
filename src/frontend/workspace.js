@@ -79,6 +79,42 @@ function _wsIsAgentLine(line) {
 
 function _wsNow() { try { return performance.now(); } catch (e) { return 0; } }
 
+// Check if any open panes have severed/disconnected sockets (e.g. after sleep/wake)
+function _wsCheckAndHealPanes() {
+  if (!_wsTabs || !_wsTabs.length) return;
+  _wsTabs.forEach(function (tab) {
+    if (!tab.panes) return;
+    tab.panes.forEach(function (pane) {
+      if (pane && pane.sock) {
+        if (pane.sock.readyState === 2 || pane.sock.readyState === 3) {
+          // Socket was closed or closing (e.g. server heartbeat timeout during sleep)
+          // Mark status and show restore banner if not already shown
+          var st = document.getElementById('wsStatus-' + pane.id);
+          if (st) st.textContent = 'disconnected';
+          pane.exited = true;
+          _wsUpdateStatusBar();
+          if (!pane.restoreCmd && pane.enteredCmd) {
+            pane.restoreCmd = pane.enteredCmd;
+            _wsShowRestoreBanner(pane);
+          } else if (!pane.restoreCmd && pane.cmd) {
+            pane.restoreCmd = pane.cmd;
+            _wsShowRestoreBanner(pane);
+          }
+        }
+      }
+    });
+  });
+}
+
+window.addEventListener('visibilitychange', function () {
+  if (document.visibilityState === 'visible') {
+    _wsCheckAndHealPanes();
+  }
+});
+window.addEventListener('focus', function () {
+  _wsCheckAndHealPanes();
+});
+
 // Per-pane status: exited > limit > active (recent output) > idle.
 function _wsPaneStatus(pane) {
   if (pane.exited || (pane.sock && pane.sock.readyState > 1)) return 'exited';
@@ -609,7 +645,7 @@ function _wsConnectPane(pane) {
   // Track which pane the user is "in": focusing/clicking the terminal marks it
   // as the focused pane, so saved commands / resume land where you're looking.
   host.addEventListener('focusin', function () { _wsSetFocusedPane(pane.id); });
-  host.addEventListener('mousedown', function () { _wsSetFocusedPane(pane.id); });
+  host.addEventListener('mousedown', function () { _wsSetFocusedPane(pane.id); if (pane.term) pane.term.focus(); });
 
   // Allow dropping Finder files / browser links straight onto the terminal —
   // the path (or URL) is pasted onto the prompt, quoted for POSIX. See
@@ -690,7 +726,20 @@ function _wsConnectPane(pane) {
       try { if (WS_LIMIT_RE.test(dec.decode(bytes))) pane.flaggedLimit = true; } catch (e) {}
     }
   };
-  sock.onclose = function () { setStatus('disconnected'); pane.exited = true; _wsUpdateStatusBar(); };
+  sock.onclose = function () {
+    setStatus('disconnected');
+    pane.exited = true;
+    _wsUpdateStatusBar();
+    if (!pane.restoreCmd) {
+      if (pane.enteredCmd) {
+        pane.restoreCmd = pane.enteredCmd;
+        _wsShowRestoreBanner(pane);
+      } else if (pane.cmd) {
+        pane.restoreCmd = pane.cmd;
+        _wsShowRestoreBanner(pane);
+      }
+    }
+  };
   sock.onerror = function () { setStatus('connection error'); };
 
   // Shift+Enter → insert a newline instead of submitting. Plain xterm sends a
@@ -859,6 +908,17 @@ function wsRestorePaneCmd(paneId) {
   var pane = _wsFindPane(paneId);
   if (!pane || !pane.restoreCmd) return;
   var cmd = pane._resumeCmd || _wsResumeVariant(pane.restoreCmd);
+
+  // If the socket was severed or closed (e.g. sleep/wake or killed pty), reconnect before running!
+  if (!pane.sock || pane.sock.readyState !== 1 || pane.exited) {
+    pane.cmd = cmd;
+    pane.restoreCmd = null;
+    pane._resumeCmd = null;
+    wsDismissRestore(paneId);
+    _wsReopenPane(pane);
+    return;
+  }
+
   if (pane.sock && pane.sock.readyState === 1) {
     pane.sock.send(new TextEncoder().encode(cmd + '\r'));
   }
@@ -869,6 +929,21 @@ function wsRestorePaneCmd(paneId) {
   if (pane.term) pane.term.focus();
   var st = document.getElementById('wsStatus-' + paneId);
   if (st) st.textContent = _wsPaneLabel(pane);
+  _wsSaveSession();
+}
+
+// Reconnect a severed or dead pane cleanly
+function _wsReopenPane(pane) {
+  if (!pane) return;
+  var host = document.getElementById('wsTermHost-' + pane.id);
+  if (pane.ro) { try { pane.ro.disconnect(); } catch (e) {} }
+  if (pane.sock) { try { pane.sock.onclose = null; pane.sock.close(); } catch (e) {} }
+  if (pane.term) { try { pane.term.dispose(); } catch (e) {} }
+  pane.sock = null; pane.term = null; pane.fit = null; pane.ro = null;
+  if (host) host.innerHTML = '';
+  pane.wantCwd = pane.cwd || pane.wantCwd;
+  pane.exited = false;
+  _wsConnectPane(pane);
   _wsSaveSession();
 }
 
