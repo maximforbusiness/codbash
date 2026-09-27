@@ -873,6 +873,14 @@ function _wsResumeVariant(cmd) {
       var rest = s.slice(word.length).trim();
       return env + 'codex resume --last' + (rest ? ' ' + rest : '');
     }
+    // pi / omp: `--continue` (-c) continues the previous session in this cwd
+    case 'pi':
+    case 'omp': return env + s + ' --continue';
+    // qwen: `--continue` (-c) resumes the most recent session for current project
+    case 'qwen': return env + s + ' --continue';
+    // opencode / kilo: `resume` continues previous session
+    case 'opencode':
+    case 'kilo': return env + s + ' resume';
     default: return env + s;
   }
 }
